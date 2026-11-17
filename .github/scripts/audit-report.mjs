@@ -50,13 +50,15 @@ if (!vulns.length) {
   );
   for (const vuln of vulns) {
     const via = Array.isArray(vuln?.via) ? vuln.via : [];
-    const advisory = via.find((entry) => entry && typeof entry === "object");
-    const title = advisory?.title ?? (typeof via[0] === "string" ? via[0] : "advisory");
-    const link = advisory?.url ? ` ([advisory](${advisory.url}))` : "";
     const scope = vuln?.isDirect ? "diretta" : "transitiva";
-    lines.push(
-      `- **${vuln?.name}** — ${vuln?.severity ?? "unknown"}, ${scope} — ${title}${link} — ${fixLabel(vuln?.fixAvailable)}`,
-    );
+    for (const advisory of via.length ? via : [null]) {
+      const title = typeof advisory === "string" ? `via ${advisory}` : advisory?.title ?? "advisory";
+      const severity = advisory?.severity ?? vuln?.severity ?? "unknown";
+      const link = advisory?.url ? ` ([advisory](${advisory.url}))` : "";
+      lines.push(
+        `- **${vuln?.name}** - ${severity}, ${scope} - ${title}${link} - ${fixLabel(vuln?.fixAvailable)}`,
+      );
+    }
   }
   lines.push("");
 }
