@@ -95,7 +95,7 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
         </div>
 
         <div class="flex items-center max-[620px]:hidden">
-          <a class={buttonPrimary} href="/app/dashboard">Get started</a>
+          <a class={buttonPrimary} href="/app/register">Get started</a>
         </div>
       </div>
     </nav>
@@ -107,7 +107,7 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
         <div>
           <div class={eyebrow}>Open-source URL shortener</div>
           <h1 class={`${serif} m-0 text-[clamp(4.4rem,10.6vw,9.75rem)] leading-[0.77] tracking-[-0.02em] text-balance max-[620px]:text-[clamp(3.7rem,20vw,6.2rem)]`}>
-            Short links,<br />long control.
+            Short links,{' '}<br />long control.
           </h1>
           <p class="mt-[30px] max-w-[560px] text-[clamp(1.05rem,2vw,1.3rem)] leading-[1.7] text-ink-muted">
             Brev gives you a self-hosted backend and dashboard for links, custom domains, click tracking,
@@ -130,7 +130,7 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
 
         <aside class="relative z-[1] overflow-hidden rounded-[34px] border border-line bg-surface-solid/54 p-7 shadow-[0_28px_90px_rgba(7,25,54,0.16)]" aria-label="Brev product preview">
           <div class="mb-[42px] flex items-center justify-between">
-            <span class={`${mono} rounded-full border border-line px-3 py-2 text-[0.78rem] text-ink-muted`}>brevl.ink/go</span>
+            <span class={`${mono} rounded-full border border-line px-3 py-2 text-[0.78rem] text-ink-muted`}>links.yourbrand.com/go</span>
             <span class="rounded-full border border-line px-3 py-2 text-[0.78rem] text-ink-muted">42 clicks</span>
           </div>
 
@@ -152,7 +152,7 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
 
           <div class={`${mono} mt-[26px] rounded-[20px] bg-ink p-[18px] text-[0.84rem] leading-[1.85] text-surface [&_span]:text-accent`}>
             <span>$</span> brev create https://example.com --slug go<br />
-            <span>→</span> https://brevl.ink/go
+            <span>→</span> https://links.yourbrand.com/go
           </div>
         </aside>
       </header>
@@ -222,7 +222,7 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
             <h2 class={h2}>Open source first.</h2>
           </div>
           <p class="m-0 text-[1.06rem] leading-[1.75] text-ink-muted">
-            Use the MIT-licensed stack forever. Brev Cloud can come later for people who want managed
+            Use the MIT-licensed stack forever. Brev Cloud is free today for people who want managed
             infrastructure instead of operating their own server.
           </p>
         </div>
@@ -240,13 +240,13 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
           </article>
 
           <article class="rounded-[30px] border border-line bg-ink p-[34px] text-surface">
-            <h3 class="mt-0 mb-[22px] text-xl">Brev Cloud · coming soon</h3>
-            <div class="text-[clamp(3rem,6vw,5.8rem)] font-extrabold leading-[0.85] tracking-[-0.07em]">$5</div>
-            <p class="mt-4 mb-7 text-surface/72">One-time per domain. Managed DNS, SSL, deploys, backups, and scaling.</p>
+            <h3 class="mt-0 mb-[22px] text-xl">Brev Cloud</h3>
+            <div class="text-[clamp(3rem,6vw,5.8rem)] font-extrabold leading-[0.85] tracking-[-0.07em]">$0</div>
+            <p class="mt-4 mb-7 text-surface/72">The current plan is free. No paid plans are available.</p>
             <ul class="m-0 list-none p-0">
-              <li class="border-t border-surface/16 py-2.5 text-surface/72">No infrastructure to maintain</li>
               <li class="border-t border-surface/16 py-2.5 text-surface/72">Bring your domain to brevl.ink</li>
-              <li class="border-t border-surface/16 py-2.5 text-surface/72">Hosted updates and operational support</li>
+              <li class="border-t border-surface/16 py-2.5 text-surface/72">Managed TLS</li>
+              <li class="border-t border-surface/16 py-2.5 text-surface/72">No server to maintain</li>
             </ul>
           </article>
         </div>
@@ -256,9 +256,9 @@ const buttonLight = `${buttonBase} border-surface bg-surface text-ink`;
         <div class="relative overflow-hidden rounded-[36px] bg-ink px-7 py-[58px] text-surface before:pointer-events-none before:absolute before:inset-[18px] before:rounded-[28px] before:border before:border-surface/18 before:content-['']">
           <h2 class={`${h2} relative mb-[22px]`}>Make every link feel intentional.</h2>
           <p class="relative mx-auto mt-0 mb-[30px] max-w-[560px] leading-[1.7] text-surface/72">
-            Install the CLI, self-host the stack, or join Brev Cloud when it opens. Your domain, your links, your way.
+            Install the CLI, self-host the stack, or start with Brev Cloud for free. Your domain, your links, your way.
           </p>
-          <a class={`${buttonLight} relative`} href="/app/dashboard">Get started</a>
+          <a class={`${buttonLight} relative`} href="/app/register">Get started</a>
         </div>
       </section>
     </main>
