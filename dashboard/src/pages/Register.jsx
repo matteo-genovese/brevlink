@@ -12,9 +12,10 @@ import {
   Label,
   Muted,
 } from '../components/ui';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { register } from '../api/client';
+import { loadAnalytics, track } from '../lib/analytics';
 
 export default function Register() {
   const [email, setEmail] = useState('');
@@ -24,6 +25,10 @@ export default function Register() {
   const [success, setSuccess] = useState(false);
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    loadAnalytics();
+  }, []);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -40,6 +45,7 @@ export default function Register() {
     setLoading(true);
     try {
       await register(email, password);
+      track('Signup');
       setSuccess(true);
       window.setTimeout(() => navigate('/login'), 1200);
     } catch (err) {

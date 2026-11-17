@@ -42,10 +42,11 @@ and communicated to registered users.
   within the EU, for verification, password resets, email changes and domain
   invitations.
 - Plausible is self-hosted on the controller's infrastructure at novezero.it.
-  It is not a third party or subprocessor. It measures the landing and legal
-  pages only, without cookies, profiling, personal-data retention or analytics
-  transfers to third parties. IP addresses derive country and are not retained.
-  No website analytics is added to the authenticated dashboard.
+  It is not a third party or subprocessor. It measures the landing, the legal
+  pages and the public registration page, plus one account-created event,
+  without cookies, profiling, personal-data retention or analytics transfers
+  to third parties. IP addresses derive country and are not retained.
+  No website analytics is added inside the authenticated dashboard.
 - GitHub hosts the public repository and security reports, without processing
   service users' data. Stripe is not enabled and no payment data is processed.
 - Accounts can be exported as JSON, email addresses can be changed using the
