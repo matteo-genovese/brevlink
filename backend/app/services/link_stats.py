@@ -8,7 +8,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from fastapi import Request
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.link import Link
 from app.models.link_stats import LinkClickDaily, LinkClickEvent
-from app.services.links import _link_to_out, increment_clicks
+from app.services.links import _link_to_out, get_qr_link_by_slug, increment_clicks
 
 BOT = re.compile(r"bot|crawler|spider|slurp|bingpreview|facebookexternalhit|facebot|twitterbot|linkedinbot|whatsapp|telegrambot|discordbot|slackbot|googleother|headlesschrome|lighthouse|monitor|uptimerobot", re.I)
 
@@ -87,6 +87,69 @@ async def record_click(db: AsyncSession, link: Link, request: Request, now: date
         set_={"clicks": LinkClickDaily.clicks + 1, "visitors": LinkClickDaily.visitors + new_visitor},
     ))
     return True
+
+
+async def read_open_status(db: AsyncSession, user_id: uuid.UUID, host: str | None, entries: list[tuple[str, datetime]]):
+    """For each (slug, since), the first accepted click at or after since.
+
+    Only positive evidence is reported. A None means "no accepted click found"
+    for a link we could measure, never "the link was not opened": events are
+    one row per visitor per UTC day with the day's first time and a hit count,
+    so a later visit that day keeps the earlier timestamp. Returns the links it
+    could not prove, so the caller can omit them instead of answering None.
+    """
+    checked_through = datetime.now(UTC)
+    found: dict[str, datetime | None] = {}
+    unprovable: set[str] = set()
+    # Each entry is read over its OWN interval: two deliveries of the same
+    # slug share the slug, but one may have happened before the other.
+    for slug, since in entries:
+        if slug in found or slug in unprovable:
+            continue
+        link = await get_qr_link_by_slug(db, slug, str(user_id), host)
+        # Unreadable links are omitted, not reported as never opened.
+        if link is None or not link.is_active or link.is_flagged:
+            unprovable.add(slug)
+            continue
+        start, end = since.replace(tzinfo=None), checked_through.replace(tzinfo=None)
+        start_day = start.date()
+        # SQLite renders "YYYY-MM-DD HH:MM:SS.ffffff+00:00", which sorts after
+        # the same-day ISO form of these bounds: compare them as Python does
+        # (after normalizing), not as raw text. The batch is bounded, so the
+        # read stays one query per link.
+        first = min(
+            (
+                moment.replace(tzinfo=None)
+                for moment in await db.scalars(
+                    select(LinkClickEvent.occurred_at).where(
+                        LinkClickEvent.link_id == link.id,
+                        LinkClickEvent.day >= start.date() - timedelta(days=1),
+                    )
+                )
+                if moment.replace(tzinfo=None) >= start
+            ),
+            default=None,
+            key=lambda moment: moment.replace(tzinfo=None),
+        )
+        if first is not None:
+            found[slug] = first.replace(tzinfo=UTC)
+            continue
+        # Rows with earlier visits may hide one made in this interval: a repeat
+        # count absorbs it and a day bucket keeps its first timestamp, so the
+        # absence of a later timestamp proves nothing. Only the previous day is
+        # old enough to hide an earlier same-day visit this way.
+        hidden = await db.scalar(
+            select(LinkClickEvent.id).where(
+                LinkClickEvent.link_id == link.id,
+                LinkClickEvent.day >= start_day - timedelta(days=1),
+                or_(LinkClickEvent.hits > 1, LinkClickEvent.day == start_day),
+            ).limit(1)
+        )
+        if hidden is not None:
+            unprovable.add(slug)
+            continue
+        found[slug] = None
+    return checked_through, {slug: when for slug, when in found.items() if slug not in unprovable}
 
 
 async def prune_click_events(db: AsyncSession, now: datetime | None = None) -> int:

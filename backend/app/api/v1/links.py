@@ -10,8 +10,17 @@ from app.api.deps import get_current_feature_user
 from app.core.database import db_session
 from app.core.rate_limit import rate_limit
 from app.models.user import User
-from app.schemas.link import LinkCreate, LinkList, LinkOut, LinkUpdate
+from app.schemas.link import (
+    LinkCreate,
+    LinkList,
+    LinkOut,
+    LinkUpdate,
+    OpenStatusRequest,
+    OpenStatusResponse,
+    OpenStatusResult,
+)
 from app.services import links as links_service
+from app.services.link_stats import read_open_status
 from app.services.qr import generate_qr_svg
 
 router = APIRouter(prefix="/links", tags=["links"])
@@ -29,6 +38,28 @@ async def create_link(
     user: User = Depends(get_current_feature_user),
 ):
     return await links_service.create_link(db, str(user.id), body)
+
+
+@router.post("/open-status", response_model=OpenStatusResponse)
+async def open_status(
+    body: OpenStatusRequest,
+    db: AsyncSession = db_session,
+    user: User = Depends(get_current_feature_user),
+):
+    """Batched "did these links get opened since T" for one host.
+
+    Slugs the caller cannot read, inactive or flagged links, and links whose
+    events cannot prove an answer are left out; null means a measurable link
+    recorded no accepted click in the whole interval.
+    """
+    checked_through, found = await read_open_status(
+        db, user.id, body.host,
+        [(entry.slug, body.point(entry)) for entry in body.entries],
+    )
+    return OpenStatusResponse(
+        checked_through=checked_through,
+        entries=[OpenStatusResult(slug=slug, opened_at=opened_at) for slug, opened_at in found.items()],
+    )
 
 
 @router.get("", response_model=LinkList)
