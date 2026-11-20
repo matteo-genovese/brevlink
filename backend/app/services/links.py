@@ -321,11 +321,15 @@ async def update_link(
             detail="Link not found",
         )
 
-    if body.url is not None:
+    if body.url is not None and str(body.url) != link.url:
         link.url = str(body.url)
+        link.reliable_open_status = False
     if body.slug is not None and body.slug != link.slug:
         await _ensure_slug_available(db, body.slug, link.domain_id, exclude_id=link.id)
         link.slug = body.slug
+        # Stored clicks belong to the original short URL. A rename (even
+        # one later reversed) cannot establish coverage for the new URL.
+        link.reliable_open_status = False
     # An explicit null clears a title; omission leaves the existing title alone.
     if "title" in body.model_fields_set:
         link.title = body.title

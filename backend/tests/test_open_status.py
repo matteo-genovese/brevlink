@@ -4,6 +4,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 import os
 import uuid
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import select
@@ -377,12 +378,52 @@ def test_ordinary_link_still_redirects_when_its_click_is_lost(client, monkeypatc
     _create(client, owner)
     since = _iso(datetime.now(UTC) - timedelta(minutes=5))
     monkeypatch.setattr("app.api.v1.redirect.record_click", _fail)
+    marker = Mock(side_effect=AssertionError("ordinary link wrote a marker"))
+    monkeypatch.setattr("app.api.v1.redirect.record_click_uncertainty", marker)
     response = _redirect(client)
     assert response.status_code == 307
     assert response.headers["location"] == "https://example.com/destination"
-    assert len(_markers(client)) == 1  # the gap is still recorded, for the record
+    marker.assert_not_called()
+    assert not _markers(client)
     # Nothing is answered for it, so no zero can be wrong.
     assert _answers(_status(client, owner, [{"slug": "print-me", "since": since}]).json()) == {}
+
+
+def test_reliable_link_renamed_back_cannot_report_the_other_slugs_click(client):
+    owner = _login(client)
+    link = _reliable(client, owner, slug="alpha")
+    _age_link(client, "alpha", datetime.now(UTC) - timedelta(hours=2))
+    since = datetime.now(UTC) - timedelta(hours=1)
+    path = f"/api/v1/links/{link['id']}"
+    assert client.patch(path, headers=owner, json={"slug": "bravo"}).status_code == 200
+    assert _redirect(client, "bravo").status_code == 307
+    assert client.patch(path, headers=owner, json={"slug": "alpha"}).status_code == 200
+    assert _redirect(client, "alpha").status_code == 307
+    assert _ask(client, owner, "alpha", since) == {}
+
+
+def test_prune_preserves_repeats_that_can_fall_within_the_retained_window(client, monkeypatch):
+    from app.core.config import settings
+    from app.models.link import Link
+    from app.services.link_stats import prune_click_events, read_open_status
+
+    owner = _login(client)
+    _reliable(client, owner)
+    monkeypatch.setattr(settings, "click_event_retention_days", 7)
+    cutoff = (datetime.now(UTC) - timedelta(days=7)).replace(hour=12, minute=0, second=0)
+    first = cutoff - timedelta(minutes=10)
+    _seed(client, [first, cutoff + timedelta(minutes=30)], addresses=["203.0.113.1"] * 2)
+
+    async def scenario(db):
+        until = cutoff + timedelta(days=7)
+        await prune_click_events(db, now=until)
+        owner_id = await db.scalar(select(Link.user_id).where(Link.slug == "print-me"))
+        _, found = await read_open_status(db, owner_id, "brevl.ink", [
+            ("print-me", cutoff + timedelta(minutes=15)),
+        ], until=until)
+        return found
+
+    assert _db(client, scenario) == {}
 
 
 def test_strict_link_stops_when_both_writes_fail(client, monkeypatch):

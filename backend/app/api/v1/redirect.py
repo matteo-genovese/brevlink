@@ -104,6 +104,8 @@ async def _record(link, request: Request) -> str:
     except Exception as error:
         # Avoid dumping SQL parameters or request data into logs.
         logger.warning("Click recording failed (%s)", type(error).__name__)
+    if not link.reliable_open_status:
+        return RECORDED
     try:
         async with asyncio.timeout(0.5):
             async with async_session() as marker_db:
@@ -112,4 +114,4 @@ async def _record(link, request: Request) -> str:
         return UNCERTAIN
     except Exception as error:
         logger.warning("Unrecorded click marker failed (%s)", type(error).__name__)
-        return RECORD_FAILED if link.reliable_open_status else RECORDED
+        return RECORD_FAILED

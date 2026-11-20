@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import logging
 
 from fastapi import Request
-from sqlalchemy import DateTime, Text, bindparam, cast, delete, func, select, text
+from sqlalchemy import DateTime, Text, bindparam, cast, delete, func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -422,7 +422,12 @@ async def prune_click_events(db: AsyncSession, now: datetime | None = None) -> i
     row says nothing about a click this marker could be hiding.
     """
     cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.click_event_retention_days)
-    result = await db.execute(delete(LinkClickEvent).where(LinkClickEvent.occurred_at < cutoff))
+    # A visitor's repeat can be anywhere after their first click on that UTC
+    # day. Keep a boundary-day row with repeats until the entire day expires.
+    result = await db.execute(delete(LinkClickEvent).where(
+        LinkClickEvent.occurred_at < cutoff,
+        or_(LinkClickEvent.hits == 1, LinkClickEvent.day < cutoff.date()),
+    ))
     # A marker only ever makes answers unknown. It goes with the raw events of
     # its own second: the marked visit's own rows cannot outlive it, and no
     # window that can still be asked about (at most retention long) reaches back.
