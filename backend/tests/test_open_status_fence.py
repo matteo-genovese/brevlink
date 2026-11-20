@@ -14,6 +14,57 @@ import uuid
 import pytest
 
 
+def test_application_sqlite_pool_waits_for_an_unwritten_click(client):
+    from sqlalchemy import select
+
+    from app.core.database import async_session
+    from app.models.link import Link
+    from app.models.link_stats import LinkClickEvent
+    from app.services.link_stats import read_open_status
+    from test_link_qr import _login
+    from test_open_status import _age_link, _reliable
+
+    owner = _login(client)
+    _reliable(client, owner)
+    clicked = datetime.now(UTC)
+    _age_link(client, "print-me", clicked - timedelta(hours=1))
+
+    async def scenario():
+        ready, release = asyncio.Event(), asyncio.Event()
+
+        async def store():
+            async with async_session() as db:
+                link = await db.scalar(select(Link).where(Link.slug == "print-me"))
+                await db.execute(Link.__table__.update().where(Link.id == link.id).values(clicks=1))
+                ready.set()
+                await release.wait()
+                db.add(LinkClickEvent(id=uuid.uuid4(), link_id=link.id, occurred_at=clicked,
+                                      day=clicked.date(), device="desktop", hits=1))
+                await db.commit()
+
+        async def read():
+            async with async_session() as db:
+                owner_id = await db.scalar(select(Link.user_id).where(Link.slug == "print-me"))
+                return await read_open_status(
+                    db, owner_id, "brevl.ink", [("print-me", clicked - timedelta(minutes=1))]
+                )
+
+        writer = asyncio.create_task(store())
+        await ready.wait()
+        reader = asyncio.create_task(read())
+        try:
+            await asyncio.wait_for(asyncio.shield(reader), 0.1)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            release.set()
+        await writer
+        return await reader
+
+    _, found = client.portal.call(scenario)
+    assert found == {"print-me": clicked}
+
+
 @pytest.fixture()
 def app_db(monkeypatch):
     """The app's modules, built on this test's database."""

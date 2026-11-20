@@ -236,6 +236,7 @@ async def get_redirect_link(db: AsyncSession, host: str, slug: str) -> Link | No
         Link.slug == slug, Link.is_flagged.is_(False)
     )
     query = _for_host(query, normalized_host, require_available=True)
+    query = query.execution_options(populate_existing=True)
     result = await db.execute(query)
     # Data from before the partial unique index may still hold duplicates:
     # resolving the first one keeps the link working instead of returning 500.

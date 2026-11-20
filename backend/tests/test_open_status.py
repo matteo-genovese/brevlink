@@ -165,9 +165,10 @@ def test_repeat_visit_hidden_behind_an_earlier_row_is_never_zero(client):
         await db.flush()
     _db(client, seed)
 
-    # The later visit has no timestamp of its own. Neither an interval that
-    # contains it nor a later one can claim no click happened.
-    assert _ask(client, owner, "print-me", first - timedelta(minutes=5)) == {}
+    # The interval that includes the known first visit can report it. The
+    # later interval cannot timestamp the repeat or report a zero.
+    result = _ask(client, owner, "print-me", first - timedelta(minutes=5))
+    assert _utc(result["print-me"]) == first.replace(tzinfo=UTC)
     assert _ask(client, owner, "print-me", first + timedelta(minutes=45)) == {}
 
 
@@ -350,11 +351,11 @@ def test_missing_foreign_and_inactive_links_are_omitted(client, monkeypatch):
     assert ask(owner) == []
     assert ask(other, **custom) == []
 
-    # Accepted membership grants the domain, so its links become readable.
+    # Domain membership does not grant access to another owner's opens.
     assert client.post(f"/api/v1/domains/{domain_id}/members", headers=owner, json={"email": "open-status-other@example.com"}).status_code == 201
     token = client.test_mailer.messages[-1].text.split("token=")[1].split()[0]
     assert client.post("/api/v1/domains/invites/accept", headers=other, json={"token": token}).status_code == 200
-    assert ask(other, **custom) == ["shared"]
+    assert ask(other, **custom) == []
     assert ask(other) == []
 
 
@@ -511,13 +512,40 @@ def test_reserved_paths_are_not_measured(client):
     assert {"health", "docs", "redoc", "api", "app"} <= RESERVED_SLUGS
     owner = _login(client)
     _reliable(client, owner, slug="health")
+    _reliable(client, owner, slug="Privacy")
     _age_link(client, "health", datetime.now(UTC) - timedelta(hours=1))
+    _age_link(client, "Privacy", datetime.now(UTC) - timedelta(hours=1))
     since = _iso(datetime.now(UTC) - timedelta(minutes=1))
     # ("openapi.json" is not a legal slug anyway: the schema refuses the dot.)
-    asked = [slug for slug in sorted(RESERVED_SLUGS) if "." not in slug]
+    asked = [slug for slug in sorted(RESERVED_SLUGS) if "." not in slug] + ["Privacy"]
     response = _status(client, owner, [{"slug": slug, "since": since} for slug in asked])
     assert response.status_code == 200, response.text
     assert response.json()["entries"] == []
+
+
+def test_repeat_inside_window_preserves_the_first_open(client):
+    owner = _login(client)
+    _reliable(client, owner)
+    first = datetime.now(UTC).replace(hour=10, minute=0, second=0) - timedelta(days=1)
+    _seed(client, [first, first + timedelta(minutes=1)], addresses=["203.0.113.1"] * 2)
+    assert _utc(_ask(client, owner, "print-me", first - timedelta(minutes=1))["print-me"]) == first
+
+
+def test_link_paused_between_initial_lookup_and_lock_is_omitted(client, monkeypatch):
+    from app.models.link import Link
+    from app.services import links
+
+    owner = _login(client)
+    _reliable(client, owner)
+    _age_link(client, "print-me", datetime.now(UTC) - timedelta(hours=1))
+    lock_links = links.lock_links
+
+    async def pause_before_lock(db, ids):
+        await db.execute(Link.__table__.update().where(Link.id.in_(ids)).values(is_active=False))
+        await lock_links(db, ids)
+
+    monkeypatch.setattr(links, "lock_links", pause_before_lock)
+    assert _ask(client, owner, "print-me", datetime.now(UTC) - timedelta(minutes=1)) == {}
 
 
 def test_paused_and_flagged_links_are_omitted(client):

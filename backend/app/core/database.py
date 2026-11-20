@@ -7,19 +7,24 @@ import re
 
 from fastapi import Depends
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 from sqlalchemy.orm import DeclarativeBase
 
 from app.core.config import settings
 
 engine_kwargs = {"echo": settings.debug}
 if settings.database_url.startswith("sqlite"):
-    engine_kwargs.update({"poolclass": StaticPool})
+    url = make_url(settings.database_url)
+    if url.database in (None, "", ":memory:") or url.query.get("mode") == "memory":
+        # Keep the in-memory database alive without letting two sessions
+        # share the same physical transaction.
+        engine_kwargs.update(poolclass=AsyncAdaptedQueuePool, pool_size=1, max_overflow=0)
 else:
     engine_kwargs.update({
         "pool_size": 5,

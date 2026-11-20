@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 
 import logging
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 from sqlalchemy import DateTime, Text, bindparam, cast, delete, func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -17,7 +17,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.models.domain import DomainMember
+from app.models.domain import Domain
 from app.models.link import Link
 from app.models.link_stats import LinkClickDaily, LinkClickEvent, LinkClickUncertainty
 from app.services import links as link_service
@@ -189,33 +189,14 @@ async def read_open_status(
         # keeps the slug out of the whole batch.
         if slug in unprovable or slug in eligible:
             continue
-        if slug in RESERVED_SLUGS:
+        if slug.lower() in RESERVED_SLUGS:
             # Caddy and FastAPI consume these paths: no redirect, no clicks.
             unprovable.add(slug)
             continue
         # Whatever the redirect answers this host with. Read, not locked: an
         # entry that fails any check below must take no lock at all.
         link = await get_redirect_link(db, host or "", slug)
-        if link is None:
-            unprovable.add(slug)
-            continue
-        # A paused (owner) or flagged (moderation) link is 404 from the
-        # redirect no matter what it recorded before, so its recent window
-        # measured no visit: answered zeroes would describe a link nobody can open.
-        if not link.is_active or link.is_flagged or not link.reliable_open_status:
-            unprovable.add(slug)
-            continue
-        # Same access rule as the authenticated reads: own link, own domain,
-        # or a domain shared with this account.
-        try:
-            readable = link.user_id == user_id or (
-                link.domain is not None and await _can_read_domain(db, link, user_id)
-            )
-        except (HTTPException, SQLAlchemyError) as error:
-            # 409 (same slug on two domains) or a failed lookup: no guess.
-            logging.getLogger(__name__).warning("Open status lookup failed (%s)", type(error).__name__)
-            readable = False
-        if not readable:
+        if not _can_measure(link, user_id):
             unprovable.add(slug)
             continue
         eligible[slug] = (link, since)
@@ -224,14 +205,27 @@ async def read_open_status(
     # in the same order and cannot deadlock on each other. A lock is taken
     # only after an entry has passed every check, so no entry the caller may
     # not read touches a row, not even with a no-op.
+    domain_ids = {link.domain_id for link, _ in eligible.values() if link.domain_id is not None}
+    if domain_ids and db.get_bind().dialect.name == "postgresql":
+        # A domain can be suspended independently of its links. Keep its
+        # routing state stable until this batch commits.
+        await db.execute(
+            select(Domain.id).where(Domain.id.in_(domain_ids)).order_by(Domain.id)
+            .with_for_update(read=True)
+        )
     await link_service.lock_links(db, [link.id for link, _ in eligible.values()])
+    served = {}
+    for slug, (link, since) in eligible.items():
+        current = await get_redirect_link(db, host or "", slug)
+        if _can_measure(current, user_id) and current.id == link.id:
+            served[slug] = (current, since)
     # One instant for the whole batch, read after the last lock: a click store
     # that had it before is committed and visible, and one that gets it later
     # records a later instant. Every query below is bounded by this one value,
     # so no entry can be read over a window the response does not describe.
     # `until` only lets a test pin that instant; the endpoint never passes it.
     checked_through = _as_utc(until) if until is not None else datetime.now(UTC)
-    for slug, (link, since) in eligible.items():
+    for slug, (link, since) in served.items():
         ask = (link.id, since)
         if ask not in answers:
             try:
@@ -271,16 +265,11 @@ RESERVED_SLUGS = frozenset({
 })
 
 
-async def _can_read_domain(db: AsyncSession, link: Link, user_id: uuid.UUID) -> bool:
-    """Same access rule as get_qr_link_by_slug: own domain or accepted member."""
-    if link.domain.user_id == user_id:  # loaded with the link by get_redirect_link
-        return True
-    member = await db.scalar(select(DomainMember.id).where(
-        DomainMember.domain_id == link.domain_id,
-        DomainMember.user_id == user_id,
-        DomainMember.accepted_at.is_not(None),
-    ))
-    return member is not None
+def _can_measure(link: Link | None, user_id: uuid.UUID) -> bool:
+    return bool(
+        link is not None and link.user_id == user_id and link.reliable_open_status
+        and link.is_active and not link.is_flagged
+    )
 
 
 _INSTANT = re.compile(
@@ -369,22 +358,11 @@ async def _first_click_between(db: AsyncSession, link: Link, since: datetime, un
     # stored, is above one. Two things can therefore have a visit inside this
     # window without any row dated there:
     #  - a marker from the start on: it may be the first open of the window;
-    #  - a repeat: a row dated inside the window whose count is above one, or
-    #    one dated before the start that repeats and so may carry a visit
-    #    inside it. Only a start after that day's first visit clears the
-    #    second: an earlier visit only repeats later, not before.
+    #  - a repeat of a visit dated before the start: its later click may be
+    #    inside the window. Repeats of in-window visits cannot precede their
+    #    own stored first instant.
     # Either makes the window unknown rather than answered: a zero would be
     # false, and a click it also holds may not be the first open.
-    inside = (await db.execute(
-        select(func.count()).select_from(LinkClickEvent).where(
-            LinkClickEvent.link_id == link_id,
-            instant(LinkClickEvent.occurred_at) >= start_at,
-            instant(LinkClickEvent.occurred_at) <= end_at,
-            LinkClickEvent.hits > 1,
-        )
-    )).scalar() or 0
-    if inside:
-        return _UNPROVABLE
     lost_inside = (await db.execute(
         select(func.count()).select_from(LinkClickUncertainty).where(
             LinkClickUncertainty.link_id == link_id,

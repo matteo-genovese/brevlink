@@ -404,9 +404,10 @@ def test_a_repeat_rolled_into_an_earlier_row_is_not_answered_as_that_earlier_cli
     since = DAY_AGO.replace(hour=22, minute=0)
     # An instant before the window is no answer for it, and neither is zero.
     assert _ask(client, owner, "print-me", since) == {}
-    # From before that day's first visit, the window holds the stored row and
-    # whatever its count hides: the later open is not the first either.
-    assert _ask(client, owner, "print-me", first - timedelta(hours=1)) == {}
+    # When the window includes the stored first visit, subsequent visits
+    # cannot change its timestamp.
+    result = _ask(client, owner, "print-me", first - timedelta(hours=1))
+    assert _utc(result["print-me"]) == first
 
 
 def test_an_unresolved_marker_before_since_still_hides_a_later_positive(client):

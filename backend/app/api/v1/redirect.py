@@ -50,6 +50,9 @@ async def redirect(slug: str, request: Request, db: AsyncSession = db_session):
         )
 
     target_url = link.url
+    # The analytics transaction can now take its own connection, including
+    # when an in-memory database has a single connection in its pool.
+    await db.close()
     outcome = await _record(link, request)
     if outcome is RECORD_FAILED:
         # A reliable link never opens without its click being accounted for:
