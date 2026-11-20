@@ -1,8 +1,13 @@
 """Batched open-status answers: positive evidence only, unreadable is omitted."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+import os
+import uuid
 
+import pytest
 from sqlalchemy import select
+
 
 from test_link_qr import _create, _domain, _login
 from test_link_stats import _db, _redirect
@@ -326,7 +331,9 @@ def test_missing_foreign_and_inactive_links_are_omitted(client, monkeypatch):
     assert ask(owner) == ["print-me"]
     assert ask(owner, **custom) == ["shared"]
     assert client.patch(f"/api/v1/links/{link['id']}", headers=owner, json={"is_active": False}).status_code == 200
-    assert ask(owner) == ["print-me"]
+    # Paused: the redirect 404s it now, so its window measured no open and no
+    # zero may say it did (see test_paused_and_flagged_links_are_omitted).
+    assert ask(owner) == []
     assert ask(other, **custom) == []
 
     # Accepted membership grants the domain, so its links become readable.
@@ -387,8 +394,8 @@ def test_strict_link_redirects_once_the_gap_is_recorded(client, monkeypatch):
     since = _iso(datetime.now(UTC) - timedelta(minutes=5))
     # An accepted click may have happened in that window: unknown, not zero.
     assert _answers(_status(client, owner, [{"slug": "print-me", "since": since}]).json()) == {}
-    # And it stays unknown for every window that covers the gap, however late.
-    assert _answers(_status(client, owner, [{"slug": "print-me", "since": _iso(datetime.now(UTC))}]).json()) == {}
+    # And it stays unknown for the window from just before the marker on.
+    assert _answers(_status(client, owner, [{"slug": "print-me", "since": _iso(datetime.now(UTC) - timedelta(seconds=5))}]).json()) == {}
 
 
 def test_unverified_or_suspended_domain_is_omitted(client, monkeypatch):
@@ -439,3 +446,121 @@ def test_auth_creation_and_redirect_stay_unchanged(client):
     assert response.headers["location"] == "https://example.com/destination"
     assert client.get("/api/v1/links/print-me", headers=owner).json()["slug"] == "print-me"
     assert client.get("/api/v1/links/missing", headers=owner).status_code == 404
+
+
+def test_answers_and_bound_carry_their_utc_offset(client):
+    """SQLite hands stored instants back naive; the answer names the offset."""
+    owner = _login(client)
+    link = _reliable(client, owner)
+    # A positive: its own instant, with UTC on the wire.
+    _seed(client, [datetime.now(UTC) - timedelta(hours=2)], slug=link["slug"])
+    since = _iso(datetime.now(UTC) - timedelta(hours=3))
+    response = _status(client, owner, [{"slug": link["slug"], "since": since}])
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert datetime.fromisoformat(payload["checked_through"]).utcoffset() == timedelta(0)
+    assert datetime.fromisoformat(payload["entries"][0]["opened_at"]).utcoffset() == timedelta(0)
+
+
+def test_a_since_beyond_checked_through_is_the_same_question(client):
+    """Every entry is asked over the same interval: measured from its start, or refused.
+
+    An entry whose start is not before checked_through has an empty interval;
+    with one shared start for the batch that cannot be told apart from the
+    others, so it is answered exactly like them.
+    """
+    owner = _login(client)
+    _reliable(client, owner, slug="quiet")
+    _reliable(client, owner, slug="other")
+    for slug in ("quiet", "other"):
+        _age_link(client, slug, datetime.now(UTC) - timedelta(days=1))
+    # Future start (inside the +1 min clock skew): refused before any read.
+    assert _status(client, owner, [{"slug": "quiet", "since": _iso(datetime.now(UTC) + timedelta(seconds=30))}]).status_code == 422
+    # A real interval, both links: both are measured zeroes.
+    past = _status(client, owner, [{"slug": "quiet", "since": _iso(datetime.now(UTC) - timedelta(minutes=5))},
+                                   {"slug": "other", "since": _iso(datetime.now(UTC) - timedelta(minutes=5))}])
+    assert _answers(past.json()) == {"quiet": None, "other": None}
+
+
+def test_exact_start_counts_a_click_at_that_instant(client):
+    owner = _login(client)
+    link = _reliable(client, owner)
+    _seed(client, [datetime.now(UTC) - timedelta(hours=2)], slug=link["slug"])
+    since = _last_click(client, link["slug"])
+    assert _utc(_ask(client, owner, link["slug"], since)[link["slug"]]) == since
+
+
+def test_reserved_paths_are_not_measured(client):
+    """Caddy and the app answer these paths before the redirect: no clicks to measure."""
+    from app.services.link_stats import RESERVED_SLUGS
+
+    assert {"health", "docs", "redoc", "api", "app"} <= RESERVED_SLUGS
+    owner = _login(client)
+    _reliable(client, owner, slug="health")
+    _age_link(client, "health", datetime.now(UTC) - timedelta(hours=1))
+    since = _iso(datetime.now(UTC) - timedelta(minutes=1))
+    # ("openapi.json" is not a legal slug anyway: the schema refuses the dot.)
+    asked = [slug for slug in sorted(RESERVED_SLUGS) if "." not in slug]
+    response = _status(client, owner, [{"slug": slug, "since": since} for slug in asked])
+    assert response.status_code == 200, response.text
+    assert response.json()["entries"] == []
+
+
+def test_paused_and_flagged_links_are_omitted(client):
+    """The redirect 404s a paused or flagged link: a zero there measures nothing."""
+    from app.models.link import Link
+
+    owner = _login(client)
+    paused = _reliable(client, owner, slug="paused")
+    flagged = _reliable(client, owner, slug="flagged")
+    _reliable(client, owner, slug="never-opened")
+    for slug in ("paused", "flagged", "never-opened"):
+        _age_link(client, slug, datetime.now(UTC) - timedelta(hours=1))
+    since = _iso(datetime.now(UTC) - timedelta(minutes=1))
+    assert client.patch(f"/api/v1/links/{paused['id']}", headers=owner, json={"is_active": False}).status_code == 200
+    _db(client, lambda db: db.execute(Link.__table__.update().where(Link.slug == "flagged").values(is_flagged=True)))
+    for slug in ("paused", "flagged"):
+        assert client.get(f"/{slug}", headers={"host": "brevl.ink", "accept": "application/json"}).status_code == 404
+    assert _answers(_status(client, owner, [{"slug": slug, "since": since}
+                                            for slug in ("paused", "flagged", "never-opened")]).json()) == {"never-opened": None}
+    # Un-paused, the link is served again and its window is measured again.
+    assert client.patch(f"/api/v1/links/{paused['id']}", headers=owner, json={"is_active": True}).status_code == 200
+    assert _ask(client, owner, "paused", datetime.now(UTC) - timedelta(seconds=30)) == {"paused": None}
+
+
+def _mark(client, slug, when):
+    from app.models.link import Link
+    from app.models.link_stats import LinkClickUncertainty
+
+    async def write(db):
+        link_id = (await db.execute(select(Link.id).where(Link.slug == slug))).scalar_one()
+        db.add(LinkClickUncertainty(link_id=link_id, occurred_at=when, last_at=when, hits=1))
+        await db.flush()
+    _db(client, write)
+
+
+def test_uncertainty_interval(client):
+    """A marker seen after the first click: the click is still the first open."""
+    owner = _login(client)
+    link = _reliable(client, owner)
+    now = datetime.now(UTC).replace(microsecond=0)
+    first = now - timedelta(hours=3)
+    _seed(client, [first], slug=link["slug"])
+    _mark(client, link["slug"], now.replace(microsecond=0) - timedelta(hours=5))
+    assert _ask(client, owner, link["slug"], now - timedelta(hours=4)) == {link["slug"]: first.isoformat()}
+    # (The marker is epoch, from the suite's own seed of another link; see
+    # test_marker_inside_the_interval_withholds_the_first_open for the in-window case.)
+
+
+def test_marker_inside_the_interval_withholds_the_first_open(client):
+    """The lost click a marker stands for may precede the proven one: answer nothing."""
+    owner = _login(client)
+    link = _reliable(client, owner)
+    now = datetime.now(UTC).replace(microsecond=0)
+    first = now - timedelta(hours=3)
+    _seed(client, [first], slug=link["slug"])
+    _mark(client, link["slug"], now.replace(microsecond=0) - timedelta(hours=3, seconds=1))
+    # The window that contains the marker: no later first open.
+    assert _ask(client, owner, link["slug"], now - timedelta(hours=3, minutes=30)) == {}
+    # A window starting after the marker: the click alone is in it, and it is the answer.
+    assert _ask(client, owner, link["slug"], first - timedelta(microseconds=500000)) == {link["slug"]: first.isoformat()}

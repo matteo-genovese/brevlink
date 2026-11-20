@@ -66,6 +66,20 @@ async def open_status(
             db, user.id, body.host or settings.default_domain,
             [(entry.slug, body.point(entry)) for entry in body.entries],
         )
+        # Read and committed: no entry's lock is still held, and no answer is
+        # one a waiting store then contradicts.
+        await db.commit()
+        # An entry that starts at (or after) checked_through proves nothing:
+        # (since, checked_through] is empty. It is left out, so no zero can
+        # claim the interval between its start and the bound was read; a call
+        # asking only that is refused below.
+        empty = {entry.slug for entry in body.entries if body.empty_window(entry, checked_through)}
+        found = {slug: opened_at for slug, opened_at in found.items() if slug not in empty}
+        if empty and all(body.empty_window(entry, checked_through) for entry in body.entries):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="since is not before checked_through; there is nothing to measure",
+            )
     except SQLAlchemyError:
         logging.getLogger(__name__).exception("Open status read failed")
         raise HTTPException(

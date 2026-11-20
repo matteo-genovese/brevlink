@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, field_serializer, field_validator, model_validator
 
 from app.core.config import settings
 
@@ -128,12 +128,30 @@ class OpenStatusRequest(BaseModel):
     def point(self, entry: OpenStatusEntry) -> datetime:
         return entry.since or self.since
 
+    def empty_window(self, entry: OpenStatusEntry, checked_through: datetime) -> bool:
+        """Asked from an instant the read already covers: (since, bound] is empty."""
+        return self.point(entry) >= checked_through
+
+
+def _serialize_utc(value: datetime) -> str:
+    # Stored instants come back naive from SQLite, and actual UTC; name the
+    # offset on the wire rather than leaving the reader to assume a local one.
+    return (value.replace(tzinfo=UTC) if value.tzinfo is None else value).astimezone(UTC).isoformat()
+
 
 class OpenStatusResult(BaseModel):
     slug: str
     opened_at: datetime | None
 
+    @field_serializer("opened_at")
+    def _opened_at_utc(self, value: datetime | None) -> str | None:
+        return None if value is None else _serialize_utc(value)
+
 
 class OpenStatusResponse(BaseModel):
     checked_through: datetime
     entries: list[OpenStatusResult]
+
+    @field_serializer("checked_through")
+    def _checked_through_utc(self, value: datetime) -> str:
+        return _serialize_utc(value)

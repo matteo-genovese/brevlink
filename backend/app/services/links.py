@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import secrets
 import string
 import uuid
@@ -239,6 +240,37 @@ async def get_redirect_link(db: AsyncSession, host: str, slug: str) -> Link | No
     # Data from before the partial unique index may still hold duplicates:
     # resolving the first one keeps the link working instead of returning 500.
     return result.scalars().first()
+
+
+async def lock_link(db: AsyncSession, link_id: uuid.UUID) -> None:
+    """Serialization point for writing and reading a link's click record.
+
+    Every click store takes this row lock first and commits last, so a reader
+    that takes it cannot overlap one: it waits for the store to commit and
+    sees the click. Writes nothing, but a write rather than a read, because
+    only a write waits for another transaction's lock (Postgres) and ends the
+    read snapshot you might hold (SQLite) instead of reusing it.
+    """
+    await db.execute(update(Link).where(Link.id == link_id).values(clicks=Link.clicks + 0))
+
+
+async def lock_and_resolve(db: AsyncSession, host: str, slug: str) -> tuple[Link, datetime] | None:
+    """The link the redirect would serve, locked so this read cannot race its stores.
+
+    `now` is fixed after the lock: a click store that had it before is
+    committed and visible, and one that gets it later records a later instant.
+    """
+    # A write first, not a read: in SQLite a read keeps its snapshot, and the
+    # lock below would then hand back pre-store data.
+    await db.execute(update(Link).where(Link.id.is_(None)).values(clicks=Link.clicks + 0))
+    link = await get_redirect_link(db, host, slug)
+    if link is None:
+        return None
+    # Click stores take this lock before their first click statement, so a
+    # store not seen yet is at or after this instant.
+    now = datetime.now(UTC)
+    await lock_link(db, link.id)
+    return link, now
 
 
 async def update_link(
