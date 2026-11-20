@@ -2,7 +2,6 @@
 
 from datetime import UTC, datetime, timedelta
 
-import pytest
 from sqlalchemy import select
 
 from test_link_qr import _create, _domain, _login
@@ -10,54 +9,117 @@ from test_link_stats import _db, _redirect
 
 
 def _status(client, headers, entries, **body):
-    return client.post("/api/v1/links/open-status", headers=headers, json={"entries": entries, **body})
+    # The default host, as the marketplace client reaches it: without it the
+    # answer would cover no host at all, and own links on the default domain
+    # are not served there.
+    return client.post(
+        "/api/v1/links/open-status", headers={**HOST, **headers},
+        json={"entries": entries, **body},
+    )
+
+
+# The host the links live on in these tests.
+HOST = {"host": "brevl.ink"}
 
 
 def _iso(when):
     return when.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _seed(client, whens, slug="print-me", now=None):
-    """Record clicks from distinct visitors; return each row's stored instant."""
+def _reliable(client, headers, **extra):
+    """A link that opted in to open-status answers (the default is off)."""
+    return _create(client, headers, **{"reliable_open_status": True, **extra})
+
+
+def _seed(client, whens, slug="print-me", addresses=None):
+    """Record clicks; return each row's stored instant.
+
+    Each visit is stamped at `when` (a backfilled event is that old) and gets
+    the address in `addresses`, by default a distinct one per visit: identity
+    comes from the address, so only same-address visits share a row. A click
+    can only exist after its link did, so the link is aged before the first.
+    """
     from app.models.link import Link
     from app.models.link_stats import LinkClickEvent
     from app.services.link_stats import record_click
     from starlette.requests import Request
 
-    # Each visit is stamped at `when` (a backfilled event is that old).
-    def visitor(index):
-        return Request({"type": "http", "headers": [(b"user-agent", b"Mozilla Linux")], "client": (f"203.0.113.{index + 1}", 9)})
+    addresses = addresses or [f"203.0.113.{index + 1}" for index in range(len(whens))]
 
     async def seed(db):
         link = (await db.execute(select(Link).where(Link.slug == slug))).scalar_one()
-        for index, when in enumerate(whens):
-            await record_click(db, link, visitor(index), now=when)
+        for address, when in zip(addresses, whens):
+            request = Request({"type": "http", "headers": [(b"user-agent", b"Mozilla Linux")], "client": (address, 9)})
+            await record_click(db, link, request, now=when)
         return sorted(event.occurred_at for event in (await db.execute(select(LinkClickEvent))).scalars())
+    _age_link(client, slug, min(whens) - timedelta(days=2))
     return _db(client, seed)
+
+
+def _age_link(client, slug, when):
+    """Born at `when`: a seeded click has to exist after its link did."""
+    from app.models.link import Link
+
+    when = (when if when.tzinfo else when.replace(tzinfo=UTC)).astimezone(UTC)
+
+    async def age(db):
+        # Never later than before: a later redirect could then be newer than
+        # the click it explains. _db commits the result, so hand back no cursor.
+        await db.execute(
+            Link.__table__.update()
+            .where(Link.slug == slug, Link.__table__.c.created_at > when)
+            .values(created_at=when)
+        )
+
+    _db(client, age)
 
 
 def _answers(payload):
     return {entry["slug"]: entry["opened_at"] for entry in payload["entries"]}
 
 
-def _ask(client, headers, slug, since):
-    return _answers(_status(client, headers, [{"slug": slug, "since": _iso(since)}]).json())
+def _born(client, slug):
+    """The instant the link was actually created, as stored (UTC)."""
+    from app.models.link import Link
+
+    async def read(db):
+        from sqlalchemy import cast, Text
+        return (await db.execute(select(cast(Link.__table__.c.created_at, Text)).where(Link.slug == slug))).scalar()
+    return _utc(_db(client, read))
 
 
-@pytest.fixture()
-def ordinary_rows(monkeypatch):
-    """Keep separate rows for separate visitors, as real fingerprints would.
+def _ask(client, headers, slug, since, **body):
+    # Naive instants in these tests are UTC. The start is asked exactly as
+    # given: moving it would answer a different question.
+    since = (since if since.tzinfo else since.replace(tzinfo=UTC)).astimezone(UTC)
+    return _answers(_status(client, headers, [{"slug": slug, "since": _iso(since)}], **body).json())
 
-    The test client reuses one peer address, and without a configured secret
-    no fingerprint is calculable, so every click would collapse into one row.
-    """
-    monkeypatch.setattr("app.services.link_stats._visitor_hash", lambda request, day: f"{id(request):032d}")
+
+def _last_click(client, slug):
+    """The instant of the newest stored click of `slug`, as stored (UTC)."""
+    from app.models.link import Link
+    from app.models.link_stats import LinkClickEvent
+    from sqlalchemy import cast, Text
+
+    async def read(db):
+        link_id = (await db.execute(select(Link.id).where(Link.slug == slug))).scalar_one()
+        return (await db.execute(
+            select(cast(LinkClickEvent.occurred_at, Text))
+            .where(LinkClickEvent.link_id == link_id)
+            .order_by(LinkClickEvent.occurred_at.desc()).limit(1)
+        )).scalar()
+    return _utc(_db(client, read))
+
+
+def _utc(stamp):
+    from app.services.link_stats import _utc as parse
+    return parse(stamp)
 
 
 def test_contract_shape_and_zero_vs_positive(client):
     owner = _login(client)
-    _create(client, owner)
-    _create(client, owner, slug="quiet")
+    _reliable(client, owner)
+    _reliable(client, owner, slug="quiet")
     now = datetime.now(UTC)
     (stored,) = _seed(client, [now - timedelta(hours=5)])
     # Stored instants come back naive from SQLite, so compare in naive UTC.
@@ -71,18 +133,18 @@ def test_contract_shape_and_zero_vs_positive(client):
     assert checked.tzinfo is not None and abs(checked - now) < timedelta(minutes=1)
     assert all(set(entry) == {"slug", "opened_at"} for entry in payload["entries"])
     answers = _answers(payload)
-    assert answers["quiet"] is None
+    assert set(answers) == {"print-me"}
     opened = datetime.fromisoformat(answers["print-me"]).replace(tzinfo=None)
     assert since < opened <= checked.replace(tzinfo=None)
     assert opened == stored
 
 
-def test_repeat_visit_is_never_answered_as_zero(client, ordinary_rows):
+def test_repeat_visit_hidden_behind_an_earlier_row_is_never_zero(client):
     owner = _login(client)
-    _create(client, owner)
+    _reliable(client, owner)
     now = datetime.now(UTC).replace(tzinfo=None)
-    first = now - timedelta(hours=2)
-    _seed(client, [first, first + timedelta(seconds=1)])  # one visitor twice: hits -> 2
+    _age_link(client, "print-me", now - timedelta(days=1))
+    _seed(client, [now - timedelta(hours=2), now - timedelta(hours=1)], addresses=["203.0.113.9", "203.0.113.9"])
 
     # The later visit has no timestamp of its own. Neither an interval that
     # contains it nor a later one can claim no click happened.
@@ -90,41 +152,55 @@ def test_repeat_visit_is_never_answered_as_zero(client, ordinary_rows):
     assert _ask(client, owner, "print-me", now - timedelta(minutes=30)) == {}
 
 
-def test_unidentifiable_rows_make_absence_unprovable(client, monkeypatch):
-    """Clicks recorded without a fingerprint still show the link was opened."""
+def test_a_later_visit_on_an_earlier_day_is_not_hidden(client):
+    """A click keeps its day's first timestamp; a later one that day is only in the total."""
     owner = _login(client)
-    _create(client, owner)
-    now = datetime.now(UTC)
-    _seed(client, [now - timedelta(minutes=30)])
+    _reliable(client, owner)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    first = now - timedelta(days=1)
+    _seed(client, [first, first + timedelta(hours=1)], addresses=["203.0.113.9", "203.0.113.9"])
+    # The stored row says yesterday 10:00: "not opened since yesterday 11:00"
+    # would hide the 11:00 visit, and the clicked total says one is missing.
+    assert _ask(client, owner, "print-me", first + timedelta(minutes=30)) == {}
+    assert _ask(client, owner, "print-me", now - timedelta(hours=1)) == {}
+
+
+def test_unidentifiable_visits_keep_their_own_rows(client, monkeypatch):
+    """Without an identity every visit is its own row, so totals still agree."""
+    owner = _login(client)
+    _reliable(client, owner)
+    now = datetime.now(UTC).replace(microsecond=0)
     monkeypatch.setattr("app.services.link_stats._visitor_hash", lambda request, day: None)
-    assert _ask(client, owner, "print-me", now - timedelta(minutes=5)) == {}
+    _seed(client, [now - timedelta(hours=2), now - timedelta(hours=1)])
+    # Both visits are inside the window: the first one is the answer.
+    answered = _ask(client, owner, "print-me", now - timedelta(hours=3))
+    assert datetime.fromisoformat(answered["print-me"]).replace(tzinfo=None) == (now - timedelta(hours=2)).replace(tzinfo=None)
 
 
-def test_duplicate_slug_entries_keep_their_own_interval(client):
+def test_duplicate_slug_entries_need_identical_intervals(client):
     owner = _login(client)
-    _create(client, owner)
+    _reliable(client, owner)
     now = datetime.now(UTC).replace(tzinfo=None)
     _seed(client, [now - timedelta(hours=3)])
     narrow, wide = now - timedelta(minutes=30), now - timedelta(hours=4)
 
-    # Two entries for one slug are two questions: one before the click
-    # reports it, a later one cannot claim "no click". Repeating the request
-    # keeps the same answers, whatever order the entries arrive in.
-    opened = datetime.fromisoformat(_ask(client, owner, "print-me", wide)["print-me"]).replace(tzinfo=None)
-    assert opened < now - timedelta(hours=2)
-    for order in ([narrow], [narrow, wide], [wide, narrow]):
-        for _ in range(2):
-            answers = _answers(_status(client, owner, [{"slug": "print-me", "since": _iso(value)} for value in order]).json())
-            if "print-me" not in answers:
-                continue  # rows of one UTC day can't be told apart: no answer
-            assert answers["print-me"] is not None and (
-                datetime.fromisoformat(answers["print-me"]).replace(tzinfo=None) < now - timedelta(hours=2)
-            )
+    # One slug gets one answer, read from whichever entry came first: two
+    # different intervals have no order-independent answer, so they are
+    # refused instead of answered from an arbitrarily chosen interval.
+    for order in ([narrow, wide], [wide, narrow]):
+        assert _status(client, owner, [{"slug": "print-me", "since": _iso(value)} for value in order]).status_code == 422
+    # The same interval repeated (also via the batch default) is one question.
+    repeated = [{"slug": "print-me", "since": _iso(wide)}] * 2
+    for payload in (repeated, [{"slug": "print-me"}, {"slug": "print-me"}], [{"slug": "print-me", "since": _iso(wide)}]):
+        body = {} if payload is repeated else {"since": _iso(wide)}
+        response = _status(client, owner, payload, **body)
+        assert response.status_code == 200, response.text
+        assert len(response.json()["entries"]) == 1
 
 
 def test_invalid_batches_are_rejected(client):
     owner = _login(client)
-    _create(client, owner)
+    _reliable(client, owner)
     now = datetime.now(UTC)
     valid = {"slug": "print-me", "since": _iso(now - timedelta(hours=1))}
     for entries in (
@@ -152,22 +228,26 @@ def test_invalid_batches_are_rejected(client):
 def test_batch_with_one_shared_since_is_read_per_slug(client):
     """The client sends one `since` for the batch, entries may omit their own."""
     owner = _login(client)
-    link = _create(client, owner)
-    now = datetime.now(UTC).replace(microsecond=0)
+    link = _reliable(client, owner)
+    # A link just created answers inside its own age; record a real visit, as
+    # a marketplace open would, and ask from its birth.
+    since = _iso(_born(client, link["slug"]))
+    assert _redirect(client).status_code == 307
     response = client.post(
         "/api/v1/links/open-status", headers=owner,
-        json={"host": "brevl.ink", "since": _iso(now - timedelta(hours=1)),
+        json={"host": "brevl.ink", "since": since,
               "entries": [{"slug": link["slug"]}]},  # no per-entry since
     )
     assert response.status_code == 200, response.text
-    assert response.json()["entries"] == [{"slug": link["slug"], "opened_at": None}]
+    assert [entry["slug"] for entry in response.json()["entries"]] == [link["slug"]]
+    assert response.json()["entries"][0]["opened_at"] is not None
 
 
 def test_interval_is_bounded_by_seven_days_and_retention(client, monkeypatch):
     from app.core.config import settings
 
     owner = _login(client)
-    _create(client, owner)
+    _reliable(client, owner)
     now = datetime.now(UTC)
     entry = {"slug": "print-me", "since": _iso(now - timedelta(days=6, hours=23))}
     assert _status(client, owner, [entry]).status_code == 200
@@ -178,9 +258,28 @@ def test_interval_is_bounded_by_seven_days_and_retention(client, monkeypatch):
     assert _status(client, owner, [dict(entry, since=_iso(now - timedelta(days=2)))]).status_code == 200
 
 
-def test_earlier_day_cannot_hide_a_click_in_the_interval(client, ordinary_rows):
+def test_only_opted_in_links_are_answered(client):
     owner = _login(client)
-    _create(client, owner)
+    _create(client, owner)  # the default: reliable_open_status is off
+    now = datetime.now(UTC)
+    _seed(client, [now - timedelta(hours=1)])
+    since = _iso(now - timedelta(minutes=30))
+    # Its click may be lost without a trace, so a zero would not be measured.
+    assert _answers(_status(client, owner, [{"slug": "print-me", "since": since}]).json()) == {}
+
+    # The opt-in is part of the create contract and of the link itself.
+    opted = _reliable(client, owner, slug="opted")
+    assert opted["reliable_open_status"] is True
+    links = {item["slug"]: item for item in client.get("/api/v1/links", headers=owner).json()["items"]}
+    assert links["print-me"]["reliable_open_status"] is False
+    assert links["opted"]["reliable_open_status"] is True
+    assert _redirect(client, "opted").status_code == 307
+    assert _ask(client, owner, "opted", _born(client, "opted"))["opted"] is not None
+
+
+def test_earlier_day_cannot_hide_a_click_in_the_interval(client):
+    owner = _login(client)
+    _reliable(client, owner)
     now = datetime.now(UTC).replace(tzinfo=None)
     _seed(client, [now - timedelta(days=1)])
     assert _ask(client, owner, "print-me", now - timedelta(hours=1)) == {"print-me": None}
@@ -188,13 +287,17 @@ def test_earlier_day_cannot_hide_a_click_in_the_interval(client, ordinary_rows):
 
 def test_filtered_bot_and_prefetch_traffic_reads_as_zero(client):
     owner = _login(client)
-    _create(client, owner)
+    _reliable(client, owner)
+    _age_link(client, "print-me", datetime.now(UTC) - timedelta(days=1))
     for headers in ({"user-agent": "TelegramBot (like TwitterBot)"}, {"user-agent": "Slackbot-LinkExpanding"}, {"purpose": "prefetch"}):
         assert _redirect(client, **headers).status_code == 307
-    since = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=5)
-    assert _ask(client, owner, "print-me", since) == {"print-me": None}
+    # None of those was an accepted click, so the period is a measured zero.
+    assert _ask(client, owner, "print-me", datetime.now(UTC) - timedelta(minutes=5)) == {"print-me": None}
     assert _redirect(client).status_code == 307
-    assert _ask(client, owner, "print-me", since)["print-me"] is not None
+    # A window from just before that click reports it, with its exact instant.
+    click = _last_click(client, "print-me")
+    reported = _ask(client, owner, "print-me", click - timedelta(milliseconds=5))
+    assert datetime.fromisoformat(reported["print-me"]).replace(tzinfo=None) == click.replace(tzinfo=None)
 
 
 def test_missing_foreign_and_inactive_links_are_omitted(client, monkeypatch):
@@ -202,11 +305,14 @@ def test_missing_foreign_and_inactive_links_are_omitted(client, monkeypatch):
 
     monkeypatch.setattr(domain_sharing, "mailer", client.test_mailer)
     owner = _login(client)
-    link = _create(client, owner)
+    link = _reliable(client, owner)
     other = _login(client, "open-status-other@example.com")
     domain_id = _domain(client, owner, monkeypatch)
-    _create(client, owner, slug="shared", domain_id=domain_id)
-    since = _iso(datetime.now(UTC) - timedelta(hours=1))
+    _reliable(client, owner, slug="shared", domain_id=domain_id)
+    # Both were never opened and both are owned here.
+    _age_link(client, "print-me", datetime.now(UTC) - timedelta(hours=2))
+    _age_link(client, "shared", datetime.now(UTC) - timedelta(hours=2))
+    since = _iso(datetime.now(UTC) - timedelta(hours=1, minutes=30))
 
     def ask(headers, **body):
         slugs = ("print-me", "inactive", "missing", "shared", "print-me")
@@ -214,19 +320,112 @@ def test_missing_foreign_and_inactive_links_are_omitted(client, monkeypatch):
         assert response.status_code == 200
         return [entry["slug"] for entry in response.json()["entries"]]
 
-    # A duplicate entry is answered once; the custom-domain link was never
-    # clicked; an unowned slug is omitted. Read order follows the batch.
-    assert ask(owner) == ["print-me", "shared"]
+    custom = {"host": "go.example.com"}
+    # A duplicate entry is answered once; an unowned slug is omitted. Read
+    # order follows the batch. Each link is asked on the host it is served on.
+    assert ask(owner) == ["print-me"]
+    assert ask(owner, **custom) == ["shared"]
     assert client.patch(f"/api/v1/links/{link['id']}", headers=owner, json={"is_active": False}).status_code == 200
-    assert ask(owner) == ["shared"]
-    assert ask(other, host="go.example.com") == []
+    assert ask(owner) == ["print-me"]
+    assert ask(other, **custom) == []
 
     # Accepted membership grants the domain, so its links become readable.
     assert client.post(f"/api/v1/domains/{domain_id}/members", headers=owner, json={"email": "open-status-other@example.com"}).status_code == 201
     token = client.test_mailer.messages[-1].text.split("token=")[1].split()[0]
     assert client.post("/api/v1/domains/invites/accept", headers=other, json={"token": token}).status_code == 200
-    assert ask(other, host="go.example.com") == ["shared"]
-    assert ask(other) == ["shared"]
+    assert ask(other, **custom) == ["shared"]
+    assert ask(other) == []
+
+
+def _fail(*args, **kwargs):
+    raise RuntimeError("analytics unavailable")
+
+
+def _markers(client):
+    from app.models.link_stats import LinkClickUncertainty
+
+    async def read(db):
+        return (await db.execute(select(LinkClickUncertainty))).scalars().all()
+    return _db(client, read)
+
+
+def test_ordinary_link_still_redirects_when_its_click_is_lost(client, monkeypatch):
+    """Not opted in: today's behaviour, and no promise is made about it."""
+    owner = _login(client)
+    _create(client, owner)
+    since = _iso(datetime.now(UTC) - timedelta(minutes=5))
+    monkeypatch.setattr("app.api.v1.redirect.record_click", _fail)
+    response = _redirect(client)
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://example.com/destination"
+    assert len(_markers(client)) == 1  # the gap is still recorded, for the record
+    # Nothing is answered for it, so no zero can be wrong.
+    assert _answers(_status(client, owner, [{"slug": "print-me", "since": since}]).json()) == {}
+
+
+def test_strict_link_stops_when_both_writes_fail(client, monkeypatch):
+    """No marketplace open happened, so a later zero is not false."""
+    owner = _login(client)
+    _reliable(client, owner)
+    monkeypatch.setattr("app.api.v1.redirect.record_click", _fail)
+    monkeypatch.setattr("app.api.v1.redirect.record_click_uncertainty", _fail)
+    response = _redirect(client)
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "60"
+    assert "location" not in response.headers
+    page = client.get("/print-me", headers={"host": "brevl.ink", "accept": "text/html"}, follow_redirects=False)
+    assert page.status_code == 503 and "try again" in page.text
+    assert _markers(client) == []
+
+
+def test_strict_link_redirects_once_the_gap_is_recorded(client, monkeypatch):
+    """The user is not held back when the gap itself is provable."""
+    owner = _login(client)
+    _reliable(client, owner)
+    monkeypatch.setattr("app.api.v1.redirect.record_click", _fail)
+    assert _redirect(client).status_code == 307
+    since = _iso(datetime.now(UTC) - timedelta(minutes=5))
+    # An accepted click may have happened in that window: unknown, not zero.
+    assert _answers(_status(client, owner, [{"slug": "print-me", "since": since}]).json()) == {}
+    # And it stays unknown for every window that covers the gap, however late.
+    assert _answers(_status(client, owner, [{"slug": "print-me", "since": _iso(datetime.now(UTC))}]).json()) == {}
+
+
+def test_unverified_or_suspended_domain_is_omitted(client, monkeypatch):
+    import uuid
+
+    from app.models.domain import Domain
+
+    owner = _login(client)
+    domain_id = _domain(client, owner, monkeypatch)
+    _reliable(client, owner, slug="on-custom", domain_id=domain_id)
+    _age_link(client, "on-custom", datetime.now(UTC) - timedelta(hours=2))
+    since = _iso(datetime.now(UTC) - timedelta(hours=1))
+
+    def ask():
+        response = _status(client, owner, [{"slug": "on-custom", "since": since}], host="go.example.com")
+        assert response.status_code == 200, response.text
+        return [entry["slug"] for entry in response.json()["entries"]]
+
+    assert ask() == ["on-custom"]
+    for flags in ({"is_suspended": True}, {"is_verified": False}):
+        _db(client, lambda db, flags=flags: db.execute(
+            Domain.__table__.update().where(Domain.id == uuid.UUID(domain_id)).values(**flags)))
+        # The redirect 404s there, so a zero would promise what it denies.
+        assert ask() == []
+    _db(client, lambda db: db.execute(
+        Domain.__table__.update().where(Domain.id == uuid.UUID(domain_id)).values(is_verified=True, is_suspended=False)))
+    assert ask() == ["on-custom"]
+
+
+def test_click_at_the_bound_is_reported(client):
+    """A click exactly at `since` is in the interval: (since, through] includes it."""
+    owner = _login(client)
+    _reliable(client, owner)
+    _seed(client, [datetime.now(UTC) - timedelta(hours=2)])
+    since = _last_click(client, "print-me")
+    reported = _ask(client, owner, "print-me", since)
+    assert datetime.fromisoformat(reported["print-me"]).replace(tzinfo=None) == since.replace(tzinfo=None)
 
 
 def test_auth_creation_and_redirect_stay_unchanged(client):

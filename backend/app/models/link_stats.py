@@ -23,6 +23,25 @@ class LinkClickEvent(Base):
     hits: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
+class LinkClickUncertainty(Base):
+    """An accepted redirect whose click record could not be stored.
+
+    Without this row an unrecorded visit would read as "no click since T", so
+    the redirect tries to write it in its own short transaction. A row in an
+    interval makes that interval unprovable for the link. It carries no
+    visitor data, and occurrences are kept as [first, last].
+    """
+    __tablename__ = "link_click_uncertainty"
+
+    # Both columns are the key: one marker row per link per second.
+    link_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("links.id", ondelete="CASCADE"), primary_key=True)
+    # Truncated to the second: failures in the same second share one row
+    # instead of colliding, and later ones add their own.
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    last_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    hits: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+
 class LinkClickDaily(Base):
     __tablename__ = "link_click_daily"
     __table_args__ = (UniqueConstraint("link_id", "day", name="uq_click_daily_link_day"),)

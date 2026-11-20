@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     Uuid,
+    false,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -63,6 +64,11 @@ class Link(Base):
     title: Mapped[str | None] = mapped_column(String(256), default=None)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_flagged: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Opted in to open-status: a click record that fails stops the redirect
+    # (503) unless the gap itself can be recorded, so "no click" stays true.
+    reliable_open_status: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
     clicks: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(UTC)

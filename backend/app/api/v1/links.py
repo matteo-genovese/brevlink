@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_feature_user
+from app.core.config import settings
 from app.core.database import db_session
 from app.core.rate_limit import rate_limit
 from app.models.user import User
@@ -48,14 +52,26 @@ async def open_status(
 ):
     """Batched "did these links get opened since T" for one host.
 
-    Slugs the caller cannot read, inactive or flagged links, and links whose
-    events cannot prove an answer are left out; null means a measurable link
-    recorded no accepted click in the whole interval.
+    Left out: slugs the caller cannot read here, links the own-domain redirect
+    does not serve, links that did not opt in to open-status, and links whose
+    clicks cannot prove an answer; null means a measurable link recorded no
+    accepted click in the whole interval. If the read fails, the batch is
+    refused (503) instead of answered empty.
     """
-    checked_through, found = await read_open_status(
-        db, user.id, body.host,
-        [(entry.slug, body.point(entry)) for entry in body.entries],
-    )
+    # The service returns the bound the read actually proves complete. A caller
+    # naming no host asks about the short links as they were shown, and those
+    # live on this deployment's default domain.
+    try:
+        checked_through, found = await read_open_status(
+            db, user.id, body.host or settings.default_domain,
+            [(entry.slug, body.point(entry)) for entry in body.entries],
+        )
+    except SQLAlchemyError:
+        logging.getLogger(__name__).exception("Open status read failed")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Open status is temporarily unavailable",
+        ) from None
     return OpenStatusResponse(
         checked_through=checked_through,
         entries=[OpenStatusResult(slug=slug, opened_at=opened_at) for slug, opened_at in found.items()],

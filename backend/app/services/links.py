@@ -10,6 +10,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import case, func, literal, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.inspection import inspect
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
@@ -92,6 +93,7 @@ async def create_link(
         slug=slug,
         url=str(body.url),
         title=body.title,
+        reliable_open_status=body.reliable_open_status,
     )
     db.add(link)
     try:
@@ -105,6 +107,13 @@ async def create_link(
             detail="That slug is already in use. Choose another one",
         ) from None
     await db.refresh(link)
+    # Both columns carry a Python-side default that is applied on first access.
+    # A response model reading them later would leave an unset attribute to
+    # evaluate that default again, so set them here against the stored row.
+    state = inspect(link)
+    for name in ("created_at", "updated_at"):
+        if name in state.unloaded:
+            await db.refresh(link, [name])
 
     return _link_to_out(link)
 
@@ -293,6 +302,7 @@ def _link_to_out(link: Link) -> LinkOut:
         url=link.url,
         title=link.title,
         is_active=link.is_active,
+        reliable_open_status=bool(link.reliable_open_status),
         clicks=link.clicks or 0,
         created_at=link.created_at,
         updated_at=link.updated_at,
