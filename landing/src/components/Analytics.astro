@@ -1,1 +1,27 @@
-<script defer data-domain="brevl.ink" src="https://plausible.novezero.it/js/script.js"></script>
+---
+// Brev Cloud's Plausible property comes from .env.production and loads only
+// on Brev Cloud hosts, so a self-hosted landing never reports its visitors to
+// it. Self-hosters can opt into their own Plausible with PUBLIC_ANALYTICS_SRC
+// and PUBLIC_ANALYTICS_DOMAIN.
+const src = import.meta.env.PUBLIC_ANALYTICS_SRC?.trim() ?? '';
+const domain = import.meta.env.PUBLIC_ANALYTICS_DOMAIN?.trim() ?? '';
+const cloudSrc = import.meta.env.PUBLIC_CLOUD_ANALYTICS_SRC?.trim() ?? '';
+const cloudDomain = import.meta.env.PUBLIC_CLOUD_ANALYTICS_DOMAIN?.trim() ?? '';
+---
+<script is:inline define:vars={{ src, domain, cloudSrc, cloudDomain }}>
+  (() => {
+    const cloudHosts = ['brevl.ink', 'www.brevl.ink'];
+    let config = null;
+    if (src || domain) {
+      if (src && domain) config = { src, domain };
+    } else if (cloudHosts.includes(window.location.hostname) && cloudSrc && cloudDomain) {
+      config = { src: cloudSrc, domain: cloudDomain };
+    }
+    if (!config) return;
+    const script = document.createElement('script');
+    script.src = config.src;
+    script.defer = true;
+    script.dataset.domain = config.domain;
+    document.head.appendChild(script);
+  })();
+</script>

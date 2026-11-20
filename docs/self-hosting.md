@@ -105,6 +105,27 @@ docker compose ps
 curl http://localhost/health
 ```
 
+## Analytics (Optional)
+
+A self-hosted install sends no analytics anywhere by default. The dashboard and
+landing load Brev Cloud's Plausible script (configured in their `.env.production`
+files) only when served from `brevl.ink`.
+
+To use your own Plausible instance, set both variables before building the
+images. They are read at build time, so rebuild after changing them:
+
+| File | Variables |
+| --- | --- |
+| `dashboard/.env.production.local` | `VITE_ANALYTICS_SRC`, `VITE_ANALYTICS_DOMAIN` |
+| `landing/.env.production.local` | `PUBLIC_ANALYTICS_SRC`, `PUBLIC_ANALYTICS_DOMAIN` |
+
+```bash
+VITE_ANALYTICS_SRC=https://plausible.example.com/js/script.js
+VITE_ANALYTICS_DOMAIN=links.example.com
+```
+
+If only one of the two variables is set, analytics stays off.
+
 ## Reverse Proxy and TLS
 
 Compose exposes plain HTTP on `HTTP_PORT`. For production, put Brev behind TLS
