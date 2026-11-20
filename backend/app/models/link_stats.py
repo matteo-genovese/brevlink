@@ -38,6 +38,11 @@ class LinkClickUncertainty(Base):
     # Truncated to the second: failures in the same second share one row
     # instead of colliding, and later ones add their own.
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    # The exact instant of the first marker in that second. It only says when
+    # the bucket opened; what a marker bounds is `last_at`.
+    first_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # The exact instant of the last marker in that second, never rounded: a
+    # read bounded before it must not take it for a marker already written.
     last_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     hits: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 

@@ -16,6 +16,30 @@ def test_legal_routes_are_explicitly_before_short_link_matcher():
         assert route in caddyfile
 
 
+def test_every_exact_path_answered_before_the_redirect_is_reserved(monkeypatch):
+    """A path Caddy answers itself never reaches the {slug} redirect: no clicks.
+
+    The open-status read omits reserved slugs instead of measuring them; this
+    keeps that set in step with the file the deployment actually loads, so a
+    new exact route added here cannot be answered as a link.
+    """
+    # This module needs no app fixture: give settings what it requires to load
+    # the constant rather than a running app.
+    monkeypatch.setenv("JWT_SECRET", "test-secret-that-is-long-enough-for-dev")
+    from app.services.link_stats import RESERVED_SLUGS
+
+    caddyfile = (Path(__file__).resolve().parents[2] / "Caddyfile").read_text(encoding="utf-8")
+    legal = caddyfile[caddyfile.index("@legal path"):]
+    legal = legal[:legal.index("\n")]
+    legal_paths = {part.strip("/") for part in legal.split("path", 1)[1].split()}
+    # /api/*, /docs, /redoc, /openapi.json, /health, /app and /app/*.
+    exact = (legal_paths | {"api", "docs", "redoc", "openapi.json", "health", "app"}) - {"openapi.json"}
+    assert {"privacy", "terms", "cookies", "legal", "subprocessors"} <= legal_paths
+    assert exact <= RESERVED_SLUGS, exact - RESERVED_SLUGS
+    # a dot cannot be in a slug, so that one is listed for the record only
+    assert "openapi.json" in RESERVED_SLUGS
+
+
 def test_saas_leg_serves_any_host_on_its_own_port():
     """Cloudflare for SaaS reaches Caddy with the customer hostname while the SNI
     is our fallback origin: the site must have no host matcher, or every customer

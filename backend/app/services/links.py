@@ -8,7 +8,7 @@ import string
 import uuid
 
 from fastapi import HTTPException, status
-from sqlalchemy import case, func, literal, or_, select, update
+from sqlalchemy import case, func, literal, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.inspection import inspect
@@ -247,11 +247,51 @@ async def lock_link(db: AsyncSession, link_id: uuid.UUID) -> None:
 
     Every click store takes this row lock first and commits last, so a reader
     that takes it cannot overlap one: it waits for the store to commit and
-    sees the click. Writes nothing, but a write rather than a read, because
-    only a write waits for another transaction's lock (Postgres) and ends the
-    read snapshot you might hold (SQLite) instead of reusing it.
+    sees the click.
+
+    Writes no value, but a write rather than a read, because only a write
+    waits for another transaction's lock (Postgres) and ends the read snapshot
+    you might hold (SQLite) instead of reusing it. `updated_at` keeps its
+    stored value: taking the lock is not an update of the link.
     """
-    await db.execute(update(Link).where(Link.id == link_id).values(clicks=Link.clicks + 0))
+    await db.execute(
+        update(Link).where(Link.id == link_id)
+        .values(clicks=Link.clicks + 0, updated_at=Link.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+
+
+# One open-status lock for the whole database: see lock_links. A constant, so
+# every deployment instance and every batch asks for the same one.
+OPEN_STATUS_LOCK = 0x62726576  # "brev"
+
+
+async def lock_links(db: AsyncSession, link_ids: list[uuid.UUID]) -> None:
+    """Lock a batch of links before reading them, one batch at a time.
+
+    A row order alone is not enough once two batches wait on each other's
+    rows: PostgreSQL detects that as a deadlock and rolls one request back,
+    and SQLite has no row locks to order. So a transaction-scoped lock lets
+    one batch in at a time (PostgreSQL: a transaction advisory lock; on
+    SQLite this is a no-op, its writer lock already serializes writers), and
+    the rows are then taken by one UPDATE with its ids in id order. On
+    PostgreSQL that UPDATE fixes the order it meets the rows in; on SQLite it
+    is the write that ends the read snapshot, so a read sees every click store
+    committed before it. Every column is set to its own value: taking the
+    lock is not an update of the link.
+
+    A batch is one request's reads: short, and never holding a click store
+    that is still open, so batches queue behind each other and a store.
+    """
+    if not link_ids:
+        return
+    if db.get_bind().dialect.name == "postgresql":
+        await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": OPEN_STATUS_LOCK})
+    await db.execute(
+        update(Link).where(Link.id.in_(sorted(link_ids)))
+        .values(clicks=Link.clicks + 0, updated_at=Link.updated_at)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def lock_and_resolve(db: AsyncSession, host: str, slug: str) -> tuple[Link, datetime] | None:
@@ -260,16 +300,11 @@ async def lock_and_resolve(db: AsyncSession, host: str, slug: str) -> tuple[Link
     `now` is fixed after the lock: a click store that had it before is
     committed and visible, and one that gets it later records a later instant.
     """
-    # A write first, not a read: in SQLite a read keeps its snapshot, and the
-    # lock below would then hand back pre-store data.
-    await db.execute(update(Link).where(Link.id.is_(None)).values(clicks=Link.clicks + 0))
     link = await get_redirect_link(db, host, slug)
     if link is None:
         return None
-    # Click stores take this lock before their first click statement, so a
-    # store not seen yet is at or after this instant.
-    now = datetime.now(UTC)
     await lock_link(db, link.id)
+    now = datetime.now(UTC)
     return link, now
 
 

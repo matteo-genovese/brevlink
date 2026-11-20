@@ -145,16 +145,30 @@ def test_contract_shape_and_zero_vs_positive(client):
 
 
 def test_repeat_visit_hidden_behind_an_earlier_row_is_never_zero(client):
+    from app.models.link import Link
+    from app.models.link_stats import LinkClickEvent
+
     owner = _login(client)
     _reliable(client, owner)
-    now = datetime.now(UTC).replace(tzinfo=None)
-    _age_link(client, "print-me", now - timedelta(days=1))
-    _seed(client, [now - timedelta(hours=2), now - timedelta(hours=1)], addresses=["203.0.113.9", "203.0.113.9"])
+    # A fixed past day, inside the 7-day limit: the local clock may still be
+    # before 09:00 of today, which would put that hour in the future.
+    day = (datetime.now(UTC) - timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    _age_link(client, "print-me", day - timedelta(days=1))
+    # 09:00, this visitor's first visit of the day. Their repeat at 10:30 the
+    # same day only raised this row's count: no row is dated 10:30.
+    first = day.replace(hour=9)
+
+    async def seed(db):
+        link_id = (await db.execute(select(Link.id).where(Link.slug == "print-me"))).scalar_one()
+        db.add(LinkClickEvent(id=uuid.uuid4(), link_id=link_id, occurred_at=first, day=first.date(),
+                              device="desktop", visitor_hash="r" * 32, hits=2))
+        await db.flush()
+    _db(client, seed)
 
     # The later visit has no timestamp of its own. Neither an interval that
     # contains it nor a later one can claim no click happened.
-    assert _ask(client, owner, "print-me", now - timedelta(hours=1, minutes=30)) == {}
-    assert _ask(client, owner, "print-me", now - timedelta(minutes=30)) == {}
+    assert _ask(client, owner, "print-me", first - timedelta(minutes=5)) == {}
+    assert _ask(client, owner, "print-me", first + timedelta(minutes=45)) == {}
 
 
 def test_a_later_visit_on_an_earlier_day_is_not_hidden(client):
@@ -534,7 +548,7 @@ def _mark(client, slug, when):
 
     async def write(db):
         link_id = (await db.execute(select(Link.id).where(Link.slug == slug))).scalar_one()
-        db.add(LinkClickUncertainty(link_id=link_id, occurred_at=when, last_at=when, hits=1))
+        db.add(LinkClickUncertainty(link_id=link_id, occurred_at=when, first_at=when, last_at=when, hits=1))
         await db.flush()
     _db(client, write)
 

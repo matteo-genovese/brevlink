@@ -24,6 +24,7 @@ def upgrade():
         "link_click_uncertainty",
         sa.Column("link_id", sa.Uuid(), sa.ForeignKey("links.id", ondelete="CASCADE"), primary_key=True),
         sa.Column("occurred_at", sa.DateTime(timezone=True), primary_key=True),
+        sa.Column("first_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("hits", sa.Integer(), nullable=False, server_default="1"),
     )

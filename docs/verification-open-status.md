@@ -15,9 +15,12 @@ python -m venv <venv> && <venv>/bin/pip install -r requirements-dev.txt
 ## Exercise
 
 ```bash
-# 26 open-status tests: the contract, the proof rules, the redirect outcomes,
-# and the read/write fence (a store held open past a read).
-PYTHONDONTWRITEBYTECODE=1 <venv>/bin/python -m pytest tests/test_open_status.py tests/test_open_status_fence.py -q
+# 35 open-status tests: the contract, the proof rules, the redirect outcomes,
+# the read/write fence (a store held open past a read), and the review cases
+# (the marker's exact instant, no lock for an unreadable entry, one bound per
+# batch, the ambiguous repeat, the deployed reserved paths).
+PYTHONDONTWRITEBYTECODE=1 <venv>/bin/python -m pytest tests/test_open_status.py \
+    tests/test_open_status_review.py tests/test_open_status_fence.py -q
 
 # Full backend suite.
 PYTHONDONTWRITEBYTECODE=1 <venv>/bin/python -m pytest tests -q
@@ -29,7 +32,7 @@ JWT_SECRET=12345678901234567890123456789012 DEBUG=false \
   <venv>/bin/alembic -c alembic.ini upgrade head
 ```
 
-Expect `26 passed`, the full suite passing, and the last migration line
+Expect `35 passed`, the full suite passing, and the last migration line
 `0012_default_domain_slug -> 0013_reliable_open_status`.
 
 The fence test also runs on PostgreSQL: give it a disposable server.
@@ -46,17 +49,29 @@ It drops and rebuilds the schema in the named database: use a disposable one.
 ## What the open-status tests prove
 
 - Opt-out links are never answered; opted-in links are.
-- A repeat visit whose later click kept an earlier timestamp is never a zero.
+- A repeat visit whose later click kept an earlier timestamp is neither a zero
+  nor answered with that earlier instant when it is outside the window.
 - A gap marker in the interval withholds the answer, unless the first proven
-  click is at or before the marker (then that click stands).
+  click is at or before the marker (then that click stands). A marker dated
+  before the interval, or inside it, leaves the window without an answer.
+- A marker keeps its exact instant, apart from the second that keys its row:
+  a marker written at :40.800 never hides, nor is hidden by, a read bounded at
+  :40.700.
+- An entry that is unresolvable, unserved, paused, not opted in, or not
+  readable takes no lock and changes no row; only entries past every check are
+  locked, in id order, and one bound is read after the last of them.
+- A pending click store keeps a read waiting on PostgreSQL, and every answer
+  in the batch is bounded by one instant read after the locks.
 - Ordinary links still 307 when their click is lost; strict links 503 only when
   the click and the marker both fail, and never redirect in that case.
 - Windows before the link's birth, on another host, on an unverified or
   suspended domain, on a paused or moderated (flagged) link, or on a link the
   caller cannot read are omitted.
 - Slugs Caddy or FastAPI answer before the redirect (`/health`, `/docs`,
-  `/redoc`, `/api`, `/app`, `openapi.json`, and the `/healthz`-style probes)
-  are omitted: those paths never serve a link.
+  `/redoc`, `/api`, `/app`, `openapi.json`, the legal pages `/privacy`,
+  `/terms`, `/cookies`, `/legal`, `/subprocessors`, and the `/healthz`-style
+  probes) are omitted: those paths never serve a link. A test reads the
+  Caddyfile and requires the reserved set to cover every exact path it answers.
 - One slug asked about two different starts in one batch is refused (422).
 - A `since` that is not before the read's own bound is left out, and refused
   when it is the whole request: `(since, checked_through]` cannot be a zero.
@@ -70,9 +85,16 @@ It drops and rebuilds the schema in the named database: use a disposable one.
 - A click store takes the link row's update lock first and commits last, and
   its click instant is read after that lock.
 - The gap marker takes the same lock, then reads its instant.
-- An open-status read takes the same lock for each entry, reads its instant
-  after it, and commits after every entry: one waiting store is included, one
-  that starts later records a later instant.
+- An open-status read resolves and authorizes every entry first (no locks),
+  then takes one batch lock, reads one instant after it, and commits after
+  reading every entry: a waiting store is included, one that starts later
+  records a later instant.
+- One row order alone is not a fence: on PostgreSQL two batches issued
+  together deadlock unless they are also serialized as transactions. The batch
+  lock therefore takes a transaction-scoped advisory lock first (a no-op on
+  SQLite, whose writer lock already serializes writers), then one UPDATE over
+  the ids in id order that sets each column to its own value. It is that write
+  which ends SQLite's read snapshot.
 - On SQLite the app raises `busy_timeout` to 30 s per transaction so the read
   waits for the store instead of failing at `database is locked`.
 

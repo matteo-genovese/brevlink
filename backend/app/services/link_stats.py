@@ -20,10 +20,11 @@ from app.core.config import settings
 from app.models.domain import DomainMember
 from app.models.link import Link
 from app.models.link_stats import LinkClickDaily, LinkClickEvent, LinkClickUncertainty
+from app.services import links as link_service
 from app.services.links import (
     _link_to_out,
+    get_redirect_link,
     increment_clicks,
-    lock_and_resolve,
     lock_link,
 )
 
@@ -129,14 +130,19 @@ async def record_click_uncertainty(db: AsyncSession, link_id: uuid.UUID, now: da
     """Remember that an accepted click could not be recorded. Caller commits.
 
     The caller must pass a fresh session: the failed analytics transaction may
-    be unusable. `now` is the second the marker was written, after the visit,
+    be unusable. `now` is the instant the marker was written, after the visit,
     so a click it stands for is at or before it.
     """
     # Serialized with the click and the open-status read, which lock first,
     # and read after the lock: a marker never predates the opportunity it
     # stands for, and no read can miss it while answering a window it covers.
     await lock_link(db, link_id)
-    moment = _as_utc(now or datetime.now(UTC)).replace(microsecond=0)
+    moment = _as_utc(now or datetime.now(UTC))
+    # One row per link and second, so markers of the same second share a
+    # bucket. The bucket is only the conflict key: the row keeps the exact
+    # instants, since a read bounded at :40.700 must not treat a marker
+    # written at :40.800 as already there.
+    bucket = moment.replace(microsecond=0)
     if db.get_bind().dialect.name == "sqlite":
         # SQLite's max() is the two-value form, but only with real operands:
         # text() of the stored column keeps it, on conflict, the stored value.
@@ -150,8 +156,9 @@ async def record_click_uncertainty(db: AsyncSession, link_id: uuid.UUID, now: da
         keep = func.greatest(LinkClickUncertainty.last_at, moment)
         insert = pg_insert
     await db.execute(
-        insert(LinkClickUncertainty).values(link_id=link_id, occurred_at=moment, last_at=moment, hits=1)
-        .on_conflict_do_update(
+        insert(LinkClickUncertainty).values(
+            link_id=link_id, occurred_at=bucket, first_at=moment, last_at=moment, hits=1,
+        ).on_conflict_do_update(
             index_elements=["link_id", "occurred_at"],
             set_={"last_at": keep, "hits": LinkClickUncertainty.hits + 1},
         )
@@ -160,7 +167,7 @@ async def record_click_uncertainty(db: AsyncSession, link_id: uuid.UUID, now: da
 
 async def read_open_status(
     db: AsyncSession, user_id: uuid.UUID, host: str | None,
-    entries: list[tuple[str, datetime]],
+    entries: list[tuple[str, datetime]], until: datetime | None = None,
 ):
     """For each (slug, since), the first accepted click in (since, checked_through].
 
@@ -173,31 +180,25 @@ async def read_open_status(
     found: dict[str, datetime | None] = {}
     unprovable: set[str] = set()
     answers: dict[tuple[uuid.UUID, datetime], datetime | None] = {}
-    # The instant read under the first entry's lock, for the caller's bound.
-    first_lock: datetime | None = None
-    # Each entry is read over its OWN interval: two deliveries of the same
-    # slug share the slug, but one may have happened before the other.
+    # The slug each readable link was asked under, in batch order. A duplicate
+    # entry is answered once; two deliveries of the same slug share the slug,
+    # but one may have happened before the other, so each keeps its interval.
+    eligible: dict[str, tuple[Link, datetime]] = {}
     for slug, since in entries:
         # The answer must not depend on entry order: an unanswered question
         # keeps the slug out of the whole batch.
-        if slug in unprovable:
+        if slug in unprovable or slug in eligible:
             continue
         if slug in RESERVED_SLUGS:
             # Caddy and FastAPI consume these paths: no redirect, no clicks.
             unprovable.add(slug)
             continue
-        # Whatever the redirect answers this host with, for a host nobody
-        # serves too: a link the redirect 404s records no click, so "not
-        # opened" would promise what the redirect denies (suspended or
-        # unverified custom domains, another deployment's links). In this
-        # session, and the caller commits after all entries: a read that is
-        # waiting holds nothing (clicks are stored in their own transactions).
-        resolved = await lock_and_resolve(db, host or "", slug)
-        if resolved is None:
+        # Whatever the redirect answers this host with. Read, not locked: an
+        # entry that fails any check below must take no lock at all.
+        link = await get_redirect_link(db, host or "", slug)
+        if link is None:
             unprovable.add(slug)
             continue
-        link, locked_at = resolved
-        first_lock = first_lock or locked_at
         # A paused (owner) or flagged (moderation) link is 404 from the
         # redirect no matter what it recorded before, so its recent window
         # measured no visit: answered zeroes would describe a link nobody can open.
@@ -217,12 +218,24 @@ async def read_open_status(
         if not readable:
             unprovable.add(slug)
             continue
+        eligible[slug] = (link, since)
+    # Every eligible row is locked before anything is read, in id order and
+    # not in batch order: two batches asking in opposite orders take the rows
+    # in the same order and cannot deadlock on each other. A lock is taken
+    # only after an entry has passed every check, so no entry the caller may
+    # not read touches a row, not even with a no-op.
+    await link_service.lock_links(db, [link.id for link, _ in eligible.values()])
+    # One instant for the whole batch, read after the last lock: a click store
+    # that had it before is committed and visible, and one that gets it later
+    # records a later instant. Every query below is bounded by this one value,
+    # so no entry can be read over a window the response does not describe.
+    # `until` only lets a test pin that instant; the endpoint never passes it.
+    checked_through = _as_utc(until) if until is not None else datetime.now(UTC)
+    for slug, (link, since) in eligible.items():
         ask = (link.id, since)
         if ask not in answers:
             try:
-                # The window closes at this entry's own lock: a click store
-                # that this zero does not count started after it.
-                answers[ask] = await _first_click_between(db, link, since, locked_at)
+                answers[ask] = await _first_click_between(db, link, since, checked_through)
             except (SQLAlchemyError, ValueError) as error:
                 logging.getLogger(__name__).warning("Open status read failed (%s)", type(error).__name__)
                 answers[ask] = _UNPROVABLE
@@ -231,19 +244,30 @@ async def read_open_status(
             unprovable.add(slug)
     # Returned after the caller commits its reads: a zero that a store was
     # about to contradict is gone by then, and the caller may not report it.
-    return _as_utc(first_lock or datetime.now(UTC)), {slug: when for slug, when in found.items() if slug not in unprovable}
+    return _as_utc(checked_through), {slug: when for slug, when in found.items() if slug not in unprovable}
 
 
 _UNPROVABLE = object()
 
-# Paths Caddy and FastAPI answer before the {slug} redirect (Caddyfile: /api/*,
-# /docs, /redoc, /openapi.json, /health, /app). A slug with one of these names
-# is never served, so a click of it is impossible and must not be measured.
-# Other consumed names (/app/... but not /app) cannot be a slug: no dot, no slash.
+# Paths Caddy answers before the {slug} redirect (Caddyfile, the `routing`
+# snippet): /api/*, /docs, /redoc, /openapi.json, /health, /app and /app/*,
+# and the legal pages it serves from the landing app with or without a
+# trailing slash (/privacy/, /terms/, ...). A slug with one of these names is
+# never served on either host, so a click of it is impossible and must not be
+# measured. Other consumed names cannot be a slug: no dot, no slash.
+# test_caddy_routing.py keeps the Caddyfile honest, test_open_status_review.py
+# reads it and requires this set to cover every exact path it answers.
 RESERVED_SLUGS = frozenset({
     "api", "app", "docs", "redoc", "openapi.json", "health",
+    # The legal pages, served by landing from the same paths.
+    "privacy", "terms", "cookies", "legal", "subprocessors",
     # The deployment's own health probes, by convention on the same path.
     "healthz", "readyz", "livez",
+    # No path of the Caddyfile that is checked here: names that would be
+    # reserved if such routes were deployed. Kept so a name serving something
+    # other than a link is never measured as one.
+    "status", "robots.txt", "sitemap.xml", "favicon.ico", "assets", "static",
+    "login", "register", "dashboard",
 })
 
 
@@ -322,8 +346,10 @@ async def _first_click_between(db: AsyncSession, link: Link, since: datetime, un
         at = lambda value: bindparam(None, value, type_=DateTime(timezone=True))  # noqa: E731
 
     start_at, end_at = at(start), at(end)
-    # Read the column itself, not the helper's result: on SQLite a value read
-    # through the helper is typed by the helper, not by the column.
+
+    # The first click the events record inside the window. Read as text: on
+    # SQLite a value read through the helper is typed by the helper, not by
+    # the column.
     first = (await db.execute(
         select(cast(LinkClickEvent.occurred_at, Text)).where(
             LinkClickEvent.link_id == link_id,
@@ -332,33 +358,80 @@ async def _first_click_between(db: AsyncSession, link: Link, since: datetime, un
         ).order_by(instant(LinkClickEvent.occurred_at)).limit(1)
     )).scalar()
     first_at = _utc(first) if first is not None else None
-    # A gap marker sits at or after the click it stands for, and at or before
-    # the store that was locked after it. So a marker in the window may stand
-    # for a click in it: the answer is unknown unless that click is already
-    # proven to be at or before the marker.
-    markers = (await db.execute(select(cast(LinkClickUncertainty.last_at, Text)).where(
-        LinkClickUncertainty.link_id == link_id,
-        instant(LinkClickUncertainty.last_at) >= start_at,
-        instant(LinkClickUncertainty.last_at) <= end_at,
-    ))).scalars().all()
-    if any(first_at is None or _utc(marker) <= first_at for marker in markers):
+    # A visit leaves one row, dated at its first click of that UTC day; a
+    # repeat of the same visitor later that day only raises that row's count.
+    # So a row is its visitor's first visit of the day, and a repeat recorded
+    # in it has no instant of its own at all.
+    #
+    # A lost visit is the same shape: a marker stands for a visit at or before
+    # its own last instant, and the visitor behind it had their first visit of
+    # the day at or before that too -- a row whose count, if the repeat was
+    # stored, is above one. Two things can therefore have a visit inside this
+    # window without any row dated there:
+    #  - a marker from the start on: it may be the first open of the window;
+    #  - a repeat: a row dated inside the window whose count is above one, or
+    #    one dated before the start that repeats and so may carry a visit
+    #    inside it. Only a start after that day's first visit clears the
+    #    second: an earlier visit only repeats later, not before.
+    # Either makes the window unknown rather than answered: a zero would be
+    # false, and a click it also holds may not be the first open.
+    inside = (await db.execute(
+        select(func.count()).select_from(LinkClickEvent).where(
+            LinkClickEvent.link_id == link_id,
+            instant(LinkClickEvent.occurred_at) >= start_at,
+            instant(LinkClickEvent.occurred_at) <= end_at,
+            LinkClickEvent.hits > 1,
+        )
+    )).scalar() or 0
+    if inside:
         return _UNPROVABLE
-    if first_at is not None:
-        return first_at  # an answer, not a comparison: its exact instant
-    # Nothing in the window is dated. A later visit keeps the first visit's
-    # timestamp and only raises that row's count, so it can hide behind a
-    # row: not behind one dated before the start with a single visit, and not
-    # behind the window's own visit, which is exactly one. A repeat among
-    # those, or a count with no row to account for it, leaves something
-    # unexplained, so absence of a timestamp stops being proof.
-    repeat = (await db.execute(
-        select(func.coalesce(func.sum(LinkClickEvent.hits), 0)).where(
+    lost_inside = (await db.execute(
+        select(func.count()).select_from(LinkClickUncertainty).where(
+            LinkClickUncertainty.link_id == link_id,
+            instant(LinkClickUncertainty.last_at) >= start_at,
+            instant(LinkClickUncertainty.last_at) <= end_at,
+        )
+    )).scalar() or 0
+    if lost_inside:
+        return _UNPROVABLE
+    repeated_before = (await db.execute(
+        select(func.count()).select_from(LinkClickEvent).where(
             LinkClickEvent.link_id == link_id,
             instant(LinkClickEvent.occurred_at) < start_at,
             LinkClickEvent.hits > 1,
         )
     )).scalar() or 0
-    if repeat:
+    if repeated_before:
+        return _UNPROVABLE
+    if first_at is not None:
+        # One row dated before the start is its visitor's only visit there. A
+        # marker dated before it may have cost a visit later that day, before
+        # any click here. A marker dated after it belongs to a visitor whose
+        # first visit of the day was at or before it, and a repeat of theirs
+        # only raised that row's count: the repeat rule above already covers
+        # that. Preferring an omission to a later first open, any marker before
+        # a first visit leaves the window without an answer.
+        lost_before = (await db.execute(select(instant(LinkClickUncertainty.last_at)).where(
+            LinkClickUncertainty.link_id == link_id,
+            instant(LinkClickUncertainty.last_at) < start_at,
+        ))).scalars().all()
+        dated = (await db.execute(select(instant(LinkClickEvent.occurred_at)).where(
+            LinkClickEvent.link_id == link_id,
+            instant(LinkClickEvent.occurred_at) < start_at,
+        ))).scalars().all()
+        if any(_utc(marker) < _utc(moment) for marker in lost_before for moment in dated):
+            return _UNPROVABLE
+        return first_at  # an answer, not a comparison: its exact instant
+    # Nothing in the window is dated, and nothing above leaves a visit in it.
+    # A marker from before the window stands for one at or before it, which
+    # may be this window's first open if it is after that day's first visit:
+    # no row then carries its instant. (A marker before that first visit is
+    # already covered: it leaves the day's visit unexplained, above.)
+    lost_before = (await db.execute(select(instant(LinkClickUncertainty.last_at)).where(
+        LinkClickUncertainty.link_id == link_id,
+        instant(LinkClickUncertainty.last_at) < start_at,
+    ))).scalars().all()
+    if lost_before:
         return _UNPROVABLE
     return None
 
