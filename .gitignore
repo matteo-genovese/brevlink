@@ -14,6 +14,7 @@ venv/
 
 # Docker
 .env
+.env.*.local
 
 # Node/build artifacts
 node_modules/

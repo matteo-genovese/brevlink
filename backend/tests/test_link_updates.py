@@ -92,6 +92,26 @@ def test_updates_enforce_ownership_and_missing_ids(client, method):
     assert stored["is_active"] is True
 
 
+def test_delete_answers_404_for_foreign_missing_and_malformed_ids(client):
+    owner = _login(client)
+    other = _login(client, "other@example.com")
+    link = _create(client, owner)
+    for link_id, headers in [
+        (link["id"], other),
+        (str(uuid.uuid4()), owner),
+        ("not-a-uuid", owner),
+        (link["slug"], owner),
+    ]:
+        response = client.delete(f"/api/v1/links/{link_id}", headers=headers)
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Link not found"}
+    assert len(client.get("/api/v1/links", headers=owner).json()["items"]) == 1
+
+    deleted = client.delete(f"/api/v1/links/{link['id']}", headers=owner)
+    assert deleted.status_code == 204
+    assert client.get("/api/v1/links", headers=owner).json()["items"] == []
+
+
 def test_edit_on_custom_domain_keeps_its_public_host(client, monkeypatch):
     headers = _login(client)
     domain = client.post("/api/v1/domains", headers=headers, json={"domain": "go.example.com"})

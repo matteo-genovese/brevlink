@@ -343,14 +343,8 @@ async def update_link(
 
 
 async def delete_link(db: AsyncSession, link_id: str, user_id: str) -> None:
-    """Delete a link. Raises 404 if not found or not owner."""
-    result = await db.execute(
-        select(Link).where(
-            Link.id == uuid.UUID(link_id),
-            Link.user_id == uuid.UUID(user_id),
-        )
-    )
-    link = result.scalar_one_or_none()
+    """Delete a link. Raises 404 if not found, not owned or not a valid id."""
+    link = await get_link_by_id(db, link_id, user_id)
     if link is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
