@@ -8,6 +8,7 @@ the read has had its chance to answer.
 import asyncio
 from datetime import UTC, datetime, timedelta
 import os
+from pathlib import Path
 import tempfile
 import uuid
 
@@ -108,7 +109,7 @@ def test_a_store_open_at_read_time_is_not_a_zero(app_db, tmp_path):
             await connection.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
             await connection.close()
         asyncio.run(clear())
-    command.upgrade(Config("alembic.ini"), "head")  # the schema a deployment has
+    command.upgrade(Config(str(Path(__file__).resolve().parents[1] / "alembic.ini")), "head")  # the schema a deployment has
     sessions = async_sessionmaker(engine, expire_on_commit=False)
 
     async def scenario():
